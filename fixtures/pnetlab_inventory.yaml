@@ -1,0 +1,21 @@
+# NetTwin AI — PNETLab inventory (Phase 2.2)
+#
+# WHERE the devices are. Never HOW to log in: credentials are read from the
+# environment (NETTWIN_DEVICE_USERNAME / NETTWIN_DEVICE_PASSWORD) by the
+# Phase-2.1 collector. An inventory containing a credential field is rejected.
+#
+# Only R2-1 currently has a confirmed management address. R2-2 and R2-4 are
+# listed with placeholder hosts so the file is complete and runnable once the
+# addresses are supplied — replace the <...> values, do not guess them.
+devices:
+  - name: R2-1
+    host: 192.168.98.34
+    platform: cisco_ios
+
+  - name: R2-2
+    host: <R2-2-MANAGEMENT-IP>
+    platform: cisco_ios
+
+  - name: R2-4
+    host: <R2-4-MANAGEMENT-IP>
+    platform: cisco_ios

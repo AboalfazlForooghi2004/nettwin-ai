@@ -1,0 +1,4 @@
+Device ID        Local Intrfce     Holdtme    Capability  Platform  Port ID
+R2-1.nettwin.lab Eth 0/1           149             R S I  Linux Uni Eth 0/1
+
+Total cdp entries displayed : 1

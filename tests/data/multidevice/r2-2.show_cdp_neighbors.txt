@@ -1,0 +1,7 @@
+Capability Codes: R - Router, T - Trans Bridge, B - Source Route Bridge
+                  S - Switch, H - Host, I - IGMP, r - Repeater, P - Phone
+
+Device ID        Local Intrfce     Holdtme    Capability  Platform  Port ID
+R2-1.nettwin.lab Eth 0/1           152             R S I  Linux Uni Eth 0/0
+
+Total cdp entries displayed : 1
