@@ -27,6 +27,7 @@ import asyncio
 import json
 import re
 import sys
+import urllib.error
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -166,6 +167,11 @@ def run_llm_loop(models: list[str], timeout: float) -> tuple[bool, str]:
     try:
         gateway_models = llm_check.list_models(base_url, api_key, timeout=10)
         print(f"  gateway reachable — {len(gateway_models)} models advertised")
+    except urllib.error.HTTPError as exc:
+        hint = " — check LLM_API_KEY in .env (cp env.example .env)" if exc.code in (
+            401, 403) else ""
+        print(f"  SKIPPED: gateway returned HTTP {exc.code}{hint}")
+        return True, f"gateway HTTP {exc.code}"
     except Exception as exc:  # noqa: BLE001 - report any connectivity issue
         print(f"  SKIPPED: gateway unreachable from here ({type(exc).__name__}: {exc})")
         print("           Run this on the machine that can reach "

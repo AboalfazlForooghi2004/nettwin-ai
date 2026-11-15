@@ -467,12 +467,17 @@ def test_server_starts_over_stdio(fixtures_dir: Path) -> None:
     from mcp.client.stdio import StdioServerParameters, stdio_client
 
     async def scenario():
+        src_dir = str(fixtures_dir.parent / "src")
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
         params = StdioServerParameters(
             command=sys.executable,
             args=["-m", "nettwin.mcp_server"],
             env={
                 **os.environ,
                 "NETTWIN_TOPOLOGY": str(fixtures_dir / "healthy.yaml"),
+                # Child must import nettwin even without an editable install.
+                "PYTHONPATH": src_dir
+                + (os.pathsep + existing_pythonpath if existing_pythonpath else ""),
             },
         )
         async with stdio_client(params, errlog=sys.stderr) as (read, write):

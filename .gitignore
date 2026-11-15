@@ -29,3 +29,6 @@ htmlcov/
 
 # Offline transfer bundles (never commit)
 *.bundle
+
+# Local git credentials (never commit)
+.git-credentials

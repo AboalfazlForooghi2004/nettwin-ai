@@ -100,6 +100,23 @@ LLM credentials/config live in `.env` (`LLM_BASE_URL`, `LLM_API_KEY`,
 `LLM_MODELS`). No device is ever contacted: lab interaction is modeled-only,
 read-only.
 
+### Troubleshooting
+
+- **`ModuleNotFoundError: No module named 'nettwin'` / `'mcp'`** — pytest is
+  not running on the venv interpreter (or the editable install broke because
+  the home path contains special characters like `@`). Fix:
+  ```bash
+  . .venv/bin/activate
+  python -m pip install -e ".[dev]"
+  python -m pytest            # always via `python -m`, never bare pytest
+  ```
+  Tests also run without any install (`pythonpath = ["src"]` in
+  pyproject.toml). For the MCP server in that case:
+  `PYTHONPATH=src python -m nettwin.mcp_server`.
+- **LLM `HTTP 401`** — `.env` still has the placeholder key; rewrite it
+  (see `env.example`) so `LLM_API_KEY` holds the real key, then verify with
+  `python scripts/llm_check.py --list`.
+
 ## Project layout
 
 ```text
