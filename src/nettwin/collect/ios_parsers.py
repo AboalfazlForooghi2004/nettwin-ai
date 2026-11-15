@@ -135,6 +135,11 @@ def _expand(expanded: str, num: str) -> str:
 # --------------------------------------------------------------------------- #
 
 _VERSION_RE = re.compile(r"Version\s+(\d+\.\d+(?:\([0-9A-Za-z]+\))?[^\s,]*)")
+# IOL (IOS on Linux) is recognised only by its documented image signature —
+# e.g. ``Linux Software (I86BI_LINUXL2-ADVENTERPRISEK9-M)`` or the image file
+# name ``i86bi-linux-l3-15.2-4M5.bin``. Anything else stays unknown: the
+# platform is never guessed from a partial match.
+_IOL_SIGNATURE_RE = re.compile(r"I86BI[_-]LINUX", re.IGNORECASE)
 _MODEL_RE = re.compile(r"^cisco\s+(\S+)\s+\(", re.MULTILINE)
 _UPTIME_RE = re.compile(r"^(.+?)\s+uptime is\s", re.MULTILINE)
 
@@ -166,7 +171,31 @@ def parse_show_version(text: str) -> tuple[ParsedVersion, list[str]]:
         parsed.model = model.group(1)
     else:
         warnings.append("show version: processor/model line not found (unavailable)")
+    parsed.model = _resolve_platform(text, parsed.model, warnings)
     return parsed, warnings
+
+
+def _resolve_platform(text: str, model: str | None, warnings: list[str]) -> str | None:
+    """Return the platform, recognising IOL by image signature only.
+
+    ``show version`` on IOL reports the processor line as ``cisco IOL (PT1005)``
+    or, on some images, no matching processor line at all. The image signature
+    (``I86BI_LINUX…``) is the documented marker; when it is present the
+    platform is reported as ``IOL``. Without the signature the parsed model is
+    returned unchanged (``None`` stays unknown — never guessed).
+    """
+    matches = list(_IOL_SIGNATURE_RE.finditer(text))
+    if not matches:
+        return model
+    if model and model.upper() == "IOL":
+        return "IOL"
+    for match in matches:
+        line = text[: match.start()].rsplit("\n", 1)[-1] + text[match.start() :].split("\n", 1)[0]
+        warnings.append(
+            f"show version: IOL image signature {match.group(0)!r} recognised in "
+            f"{line.strip()!r} (platform reported as IOL; parsed model was {model!r})"
+        )
+    return "IOL"
 
 
 # --------------------------------------------------------------------------- #
@@ -398,47 +427,167 @@ def parse_show_ip_ospf_neighbor(text: str) -> tuple[list[OspfNeighbor], list[str
 # show cdp neighbors
 # --------------------------------------------------------------------------- #
 
-_CDP_ROW_RE = re.compile(
+# CDP is a **column-aligned table**, not a whitespace-separated list: the
+# Platform column (and sometimes Capability) contains spaces ("Linux Uni")
+# while rows may be short enough that neighbouring columns run together
+# ("R S I  IOL       Eth 0/0"). Splitting on arbitrary whitespace therefore
+# cannot work. Instead the header line of the *same* output supplies the
+# column start offsets, and every row is sliced on those offsets:
+#
+#   Device ID        Local Intrfce     Holdtme    Capability  Platform  Port ID
+#   R2-2.nettwin.lab Eth 0/0           138             R S I  Linux Uni Eth 0/1
+#
+# A row that is shorter than the header (short last column) is sliced to the
+# end of the line instead of being dropped. Only when no usable header exists
+# does a whitespace fallback apply, and it is strictly anchored on the
+# numeric Holdtme column so a multi-word platform can still be recovered.
+_CDP_HEADER_RE = re.compile(r"^\s*Device\s*ID\s+Local\s+Intrfce\b")
+
+
+@dataclass
+class _CdpColumns:
+    """Character offsets of the CDP header columns in one specific output."""
+
+    local: int
+    hold: int
+    capability: int
+    platform: int
+    port: int
+
+    @classmethod
+    def from_header(cls, line: str) -> _CdpColumns | None:
+        # "Local Intrfce" is the only two-word header label; match it as a unit.
+        matches: list[tuple[int, str]] = []
+        for label, end in (
+            ("Local Intrfce", "local"),
+            ("Holdtme", "hold"),
+            ("Capability", "capability"),
+            ("Platform", "platform"),
+            ("Port ID", "port"),
+        ):
+            index = line.find(label)
+            if index < 0:
+                return None
+            matches.append((index, end))
+        offsets = dict((name, index) for index, name in matches)
+        return cls(**offsets)  # type: ignore[arg-type]
+
+
+def _cdp_slice(line: str, start: int, end: int | None) -> str:
+    """Slice one column, tolerating rows shorter than the header."""
+    stop = len(line) if end is None else end
+    return line[start:stop].strip()
+
+
+_FALLBACK_CDP_ROW_RE = re.compile(
     r"^(?P<dev>\S+)\s+"
-    r"(?P<local>[A-Za-z][A-Za-z]*\s*\d+/\d+[a-z]?)\s+"
+    r"(?P<local>[A-Za-z][A-Za-z-]*\s*\d+(?:/\d+)*[a-z]?)\s+"
     r"(?P<hold>\d+)\s+"
-    r"(?P<cap>[A-Za-z0-9 ]*?)\s{2,}"
-    r"(?P<plat>\S+)\s+"
-    r"(?P<port>[A-Za-z][A-Za-z]*\s*\d+/\d+[a-z]?)\s*$"
+    r"(?P<mid>.+?)"
+    r"(?P<port>[A-Za-z][A-Za-z-]*\s*\d+(?:/\d+)*[a-z]?)\s*$"
 )
 _CDP_HEADER_WORDS = {"deviceid", "local", "intrfce", "holdtme", "capability", "platform", "port"}
 
 
+def _cdp_capability_to_platform(mid: str) -> tuple[str, str]:
+    """Split the run between Holdtme and Port ID into (capability, platform).
+
+    ``mid`` looks like ``"R S I  Linux Uni"`` or ``"R S I     IOL"``: one or
+    more single-letter (or short token) capability codes followed by the first
+    token of the platform. The first token containing a digit or longer than
+    three characters starts the platform.
+    """
+    tokens = mid.split()
+    capability: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if len(token) > 3 or any(ch.isdigit() for ch in token):
+            break
+        capability.append(token)
+        index += 1
+    return " ".join(capability), " ".join(tokens[index:])
+
+
 def parse_show_cdp_neighbors(text: str) -> tuple[list[CdpNeighbor], list[str]]:
-    """Parse ``show cdp neighbors`` table rows (deterministic fixed columns)."""
+    """Parse ``show cdp neighbors`` rows using the header's column offsets."""
     neighbors: list[CdpNeighbor] = []
     warnings: list[str] = []
+    columns: _CdpColumns | None = None
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             continue
+        if _CDP_HEADER_RE.match(line):
+            columns = _CdpColumns.from_header(line)
+            if columns is None:
+                warnings.append(
+                    "show cdp neighbors: header found but columns not recognised — "
+                    "falling back to whitespace parsing"
+                )
+            continue
         if raw[:1].isspace():
             continue  # legend/continuation lines are indented; rows start at column 0
         lowered = line.lower()
-        if lowered.startswith("device id") or "holdtme" in lowered:
+        if "holdtme" in lowered:
             continue  # header row (tokens differ across IOS releases)
         first_word = line.split()[0].lower()
         if first_word in _CDP_HEADER_WORDS:
             continue
-        if first_word in {"interface", "total"} or "cdp entries" in line.lower():
+        if first_word in {"interface", "total"} or "cdp entries" in lowered:
             continue
-        match = _CDP_ROW_RE.match(line)
-        if not match:
+
+        if columns is not None:
+            row = _parse_cdp_row_by_columns(line, columns)
+        else:
+            row = _parse_cdp_row_fallback(line)
+        if row is None:
             warnings.append(f"show cdp neighbors: skipped unparseable row: {line.strip()!r}")
             continue
-        neighbors.append(
-            CdpNeighbor(
-                device_id=match.group("dev"),
-                local_interface=normalize_interface(match.group("local")),
-                holdtime=match.group("hold"),
-                capabilities=match.group("cap").strip(),
-                platform=match.group("plat"),
-                port_id=normalize_interface(match.group("port")),
-            )
-        )
+        neighbors.append(row)
     return neighbors, warnings
+
+
+def _parse_cdp_row_by_columns(line: str, columns: _CdpColumns) -> CdpNeighbor | None:
+    device_id = _cdp_slice(line, 0, columns.local)
+    local = _cdp_slice(line, columns.local, columns.hold)
+    holdtime = _cdp_slice(line, columns.hold, columns.capability)
+    mid = _cdp_slice(line, columns.capability, columns.port)
+    platform_and_port_start = _cdp_slice(line, columns.platform, columns.port)
+    port = _cdp_slice(line, columns.port, None)
+
+    if not device_id or not local or not holdtime.isdigit():
+        return None
+    capabilities, platform = _cdp_capability_to_platform(mid)
+    if not platform:
+        # Platform column empty in this row: take whatever sits at/after the
+        # Platform offset and before the Port ID column.
+        platform = " ".join(platform_and_port_start.split())
+    if not platform or not port:
+        return None
+    return CdpNeighbor(
+        device_id=device_id,
+        local_interface=normalize_interface(local),
+        holdtime=holdtime,
+        capabilities=capabilities,
+        platform=platform,
+        port_id=normalize_interface(port),
+    )
+
+
+def _parse_cdp_row_fallback(line: str) -> CdpNeighbor | None:
+    """Whitespace fallback when the output carried no usable header."""
+    match = _FALLBACK_CDP_ROW_RE.match(line)
+    if not match:
+        return None
+    capabilities, platform = _cdp_capability_to_platform(match.group("mid"))
+    if not platform:
+        return None
+    return CdpNeighbor(
+        device_id=match.group("dev"),
+        local_interface=normalize_interface(match.group("local")),
+        holdtime=match.group("hold"),
+        capabilities=capabilities,
+        platform=platform,
+        port_id=normalize_interface(match.group("port")),
+    )

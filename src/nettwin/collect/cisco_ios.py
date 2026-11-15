@@ -478,6 +478,55 @@ def map_to_topology(observations: DeviceObservations) -> tuple[Topology, list[st
                 if iface:
                     connected_prefix[iface] = route["prefix"]
 
+    # Candidate interfaces for next-hop resolution: every interface that has a
+    # collected connected prefix (``C … is directly connected, <iface>``).
+    # Prefix lengths come from the routing table, which is the evidence that
+    # makes "next hop belongs to this prefix" a fact rather than a guess.
+    resolvable_prefixes: dict[str, ipaddress.IPv4Network] = {}
+    for iface, prefix in connected_prefix.items():
+        try:
+            resolvable_prefixes[iface] = ipaddress.IPv4Network(prefix, strict=False)
+        except ValueError:  # pragma: no cover - parser already validates shape
+            warnings.append(
+                f"interface {iface}: connected prefix {prefix!r} is not a valid IPv4 "
+                "network — next-hop resolution unavailable for it"
+            )
+
+    def resolve_interface(next_hop: str | None) -> tuple[str | None, str]:
+        """Resolve a next hop to its outgoing interface using connected prefixes.
+
+        Returns ``(interface, note)``. ``interface`` is ``None`` unless exactly
+        one collected connected prefix contains the next hop — an ambiguous or
+        impossible match is never turned into a made-up interface.
+        """
+        if not next_hop:
+            return None, "no next-hop address to resolve against connected prefixes"
+        try:
+            address = ipaddress.IPv4Address(next_hop)
+        except ValueError:
+            return None, f"next hop {next_hop!r} is not a valid IPv4 address"
+        candidates = sorted(
+            iface
+            for iface, network in resolvable_prefixes.items()
+            if address in network
+        )
+        if len(candidates) == 1:
+            return (
+                candidates[0],
+                f"next hop {next_hop} resolved to {candidates[0]} via unique connected "
+                f"prefix {connected_prefix[candidates[0]]}",
+            )
+        if not candidates:
+            return None, (
+                f"next hop {next_hop} does not belong to any collected connected prefix "
+                "— outgoing interface stays unresolved (not invented)"
+            )
+        return None, (
+            f"next hop {next_hop} belongs to {len(candidates)} collected connected "
+            f"prefixes ({', '.join(candidates)}) — ambiguous, outgoing interface stays "
+            "unresolved (not invented)"
+        )
+
     # Interfaces ------------------------------------------------------------
     interfaces: list[Interface] = []
     interface_ids: list[str] = []
@@ -516,14 +565,31 @@ def map_to_topology(observations: DeviceObservations) -> tuple[Topology, list[st
     for index, raw in enumerate(observations.routes):
         next_hops = raw.get("next_hops") or []
         first = next_hops[0] if next_hops else {}
+        next_hop = first.get("next_hop")
         outgoing = first.get("outgoing_interface")
-        outgoing_id = name_to_id.get(outgoing, "") if outgoing else ""
+        resolved_from_prefix = False
+        if not outgoing:
+            # IOS omits the outgoing interface on some rows (a default route
+            # rendered as ``S* 0.0.0.0/0 [1/0] via 192.168.98.62``). Resolve it
+            # only when the next hop sits inside exactly one collected
+            # connected prefix; otherwise keep the route without inventing.
+            resolved, note = resolve_interface(next_hop)
+            if resolved:
+                outgoing = resolved
+                resolved_from_prefix = True
+            warnings.append(f"route {raw['prefix']}: {note}")
+        outgoing_id: str | None = name_to_id.get(outgoing) if outgoing else None
         if not outgoing_id:
             warnings.append(
                 f"route {raw['prefix']}: outgoing interface {outgoing!r} not present in "
-                "collected interfaces — route skipped (not invented)"
+                "collected interfaces — route preserved with no outgoing interface "
+                "(not invented, not dropped)"
             )
-            continue
+        if resolved_from_prefix:
+            warnings.append(
+                f"route {raw['prefix']}: outgoing interface {outgoing} was not present in "
+                "the IOS output — resolved from the unique collected connected prefix"
+            )
         if len(next_hops) > 1:
             hop_list = ", ".join(
                 f"{h.get('next_hop') or 'connected'}({h.get('outgoing_interface')})"
@@ -540,7 +606,7 @@ def map_to_topology(observations: DeviceObservations) -> tuple[Topology, list[st
                 device_id=device_id,
                 vrf_id="GLOBAL",
                 destination_prefix=raw["prefix"],
-                next_hop=first.get("next_hop"),
+                next_hop=next_hop,
                 outgoing_interface_id=outgoing_id,
                 protocol=raw["protocol"],
                 active=True,  # entry was present in the device's active table

@@ -25,8 +25,12 @@ dev = [
 # Rationale: Python has no stdlib SSH client; netmiko is the de-facto
 # standard for Cisco IOS (supports cisco_ios / IOS 15.2) and handles
 # prompt detection + paging. Install with: pip install -e ".[collect]"
+#
+# The [par4] extra pins paramiko<5: IOS 15.2 on Cisco IOL only offers the
+# legacy SHA-1 KEX algorithms that paramiko 5.x no longer negotiates. Netmiko
+# is capped below 5 for the same verified combination (4.8.0 + paramiko 4.0.0).
 collect = [
-    "netmiko>=4.3",
+    "netmiko[par4]>=4.8,<5",
 ]
 
 [project.scripts]

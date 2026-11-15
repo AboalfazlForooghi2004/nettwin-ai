@@ -27,6 +27,9 @@ htmlcov/
 .vscode/
 .DS_Store
 
+# Collector output (local evidence only — never commit)
+collected/
+
 # Offline transfer bundles (never commit)
 *.bundle
 

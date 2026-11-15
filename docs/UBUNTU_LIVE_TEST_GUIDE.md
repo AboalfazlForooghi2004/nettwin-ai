@@ -37,7 +37,7 @@ git pull
 python3 -m venv .venv      # if not already present
 source .venv/bin/activate
 python -m pip install -e ".[dev,collect]"     # adds netmiko (optional extra)
-python -c "import netmiko; print(netmiko.__version__)"
+python -c "import netmiko, paramiko; print(netmiko.__version__, paramiko.__version__)"
 ```
 
 Rationale for netmiko: Python's standard library has no SSH client;
@@ -45,6 +45,23 @@ Rationale for netmiko: Python's standard library has no SSH client;
 `cisco_ios` / IOS 15.2 prompt handling and paging). It is declared as an
 optional extra in `pyproject.toml` so the core install and the whole test
 suite remain dependency-free of SSH libraries.
+
+**Version pin (Phase 2.1).** The extra is declared as
+`netmiko[par4]>=4.8,<5`. The `par4` extra pins `paramiko<5` because IOS 15.2
+on Cisco IOL only offers the legacy SHA-1 KEX algorithms that paramiko 5.x no
+longer negotiates. A clean install must report **netmiko 4.8.x + paramiko
+4.x**:
+
+```bash
+python -c "import paramiko; assert paramiko.__version__.startswith('4.'), paramiko.__version__"
+```
+
+If your venv already contains paramiko 5.x from an earlier install, force the
+compatible combination explicitly:
+
+```bash
+python -m pip install --upgrade 'netmiko[par4]==4.8.0'
+```
 
 ## 2. Credentials (environment only — never argv, never files in git)
 

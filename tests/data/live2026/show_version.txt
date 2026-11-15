@@ -1,0 +1,7 @@
+Cisco IOS Software, Linux Software (I86BI_LINUXL2-ADVENTERPRISEK9-M), Version 15.2(4)M5, RELEASE SOFTWARE (fc2)
+Technical Support: http://www.cisco.com/techsupport
+Copyright (c) 1986-2015 by Cisco Systems, Inc.
+Compiled Fri 27-Mar-15 22:01 by prod_rel_team
+
+R2-1 uptime is 2 weeks, 4 days, 1 hour, 12 minutes
+System image file is "unix:/opt/unetlab/addons/iol/bin/i86bi-linux-l2-advipservices-15.2.bin"
