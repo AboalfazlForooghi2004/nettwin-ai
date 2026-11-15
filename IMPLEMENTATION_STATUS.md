@@ -2,10 +2,11 @@
 
 ## Current Project Status
 
-Status: MVP COMPLETE + LAB EXTENSION READY (HQ lab scenario + LLM eval loop)
+Status: MVP COMPLETE + LAB VALIDATED (HQ lab scenario + live LLM eval 12/12)
 
-Current phase: LAB VALIDATION (run `scripts/lab_demo.py` on the machine
-that can reach the LLM gateway)
+Current phase: COMPLETE — deterministic matrix 9/9 PASS and live LLM
+evaluation 12/12 correct verdicts across all 4 Qwen models (run on the
+user's machine where the gateway is reachable)
 
 ## Task Tracking
 
@@ -413,7 +414,9 @@ Known limitations:
 
 ### POST-MVP: HQ Lab Extension + LLM Setup (2026-11-14)
 
-Status: COMPLETED (pending live LLM validation from the user's machine)
+Status: COMPLETED — live-validated on the user's machine (2026-11-15):
+157 tests pass, gateway lists 4 models, accuracy table 12/12 correct
+VERDICTs (4 models × 3 scenarios) plus deterministic matrix 9/9 PASS
 
 Implementation notes:
 
@@ -450,12 +453,13 @@ Tests:
   across both firewalls, tenant isolation, missing-route matrix, both
   what-if simulations with immutability.
 - Totals: 157 passed. Ruff: all checks passed. Lab demo: deterministic
-  PASS, LLM loop skipped gracefully in-sandbox (exit 0).
+  9/9 PASS; live LLM loop 12/12 correct verdicts on the user's machine.
 
 Known limitations:
 
-- Live LLM evaluation not yet executed (sandbox egress blocked; run
-  `python scripts/lab_demo.py` on the user's machine).
+- Gateway model ids are not stable (renamed between runs);
+  `lab_demo.py` auto-falls back to the advertised list and surfaces
+  HTTP error bodies for diagnosis.
 - WAN tunnel modeled as single-BRANCH-VRF extension (no IPsec/VRF-lite
   details).
 - MGMT VRF is inert (no routes/endpoints) by design.

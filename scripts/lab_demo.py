@@ -265,6 +265,7 @@ def main() -> int:
     deterministic_ok = run_deterministic()
 
     llm_ok = True
+    llm_note = ""
     if not args.no_llm:
         env = llm_check.load_env()
         if args.models:
@@ -272,11 +273,17 @@ def main() -> int:
         else:
             models = [m.strip() for m in env.get("LLM_MODELS", "").split(",")
                       if m.strip()]
-        llm_ok, _ = run_llm_loop(models, timeout=args.timeout)
+        llm_ok, llm_note = run_llm_loop(models, timeout=args.timeout)
 
     banner("RESULT")
+    if not llm_ok:
+        llm_label = "FAIL"
+    elif llm_note:
+        llm_label = f"SKIPPED ({llm_note})"
+    else:
+        llm_label = "PASS"
     print(f"  deterministic: {'PASS' if deterministic_ok else 'FAIL'}")
-    print(f"  llm loop      : {'PASS/skipped' if llm_ok else 'FAIL'}")
+    print(f"  llm loop      : {llm_label}")
     return 0 if (deterministic_ok and llm_ok) else 1
 
 
