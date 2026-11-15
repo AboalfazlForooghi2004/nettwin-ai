@@ -1,0 +1,10 @@
+Capability Codes: R - Router, T - Trans Bridge, B - Source Route Bridge
+                  S - Switch, H - Host, I - IGMP, r - Repeater, P - Phone,
+                  D - Two-way Code, O - Outbound Port
+
+Device ID        Local Intrfce     Holdtme    Capability  Platform  Port ID
+R2-3             Eth 0/0           171             R S I  IOL       Eth 0/0
+R2-1             Eth 0/2           143          R S I     IOL       Eth 0/2
+R2-2             Eth 0/0           167             R S I  IOL       Eth 0/0
+R2-2             Eth 0/1           122             R S I  IOL       Eth 0/1
+Total cdp entries displayed : 4

@@ -1,0 +1,8 @@
+Interface              IP-Address      OK? Method Status                Protocol
+GigabitEthernet0/0     unassigned      YES unset  up                    up
+GigabitEthernet0/1     unassigned      YES unset  administratively down down
+Ethernet0/0            10.0.21.1       YES NVRAM  up                    up
+Ethernet0/1            10.0.22.1       YES NVRAM  up                    up
+Ethernet0/2            192.168.98.34   YES NVRAM  up                    up
+Loopback0              10.255.255.1    YES NVRAM  up                    up
+Vlan50                 unassigned      YES unset  down                  down

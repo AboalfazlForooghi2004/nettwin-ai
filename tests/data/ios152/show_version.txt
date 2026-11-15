@@ -1,0 +1,14 @@
+Cisco IOS Software, IOL Software (IOL-L3-15.2), Version 15.2(4)M5, RELEASE SOFTWARE (fc2)
+Technical Support: http://www.cisco.com/techsupport
+Copyright (c) 1986-2015 by Cisco Systems, Inc.
+Compiled Fri 27-Mar-15 22:01 by prod_rel_team
+
+R2-1 uptime is 5 weeks, 1 day, 3 hours, 41 minutes
+System image file is "flash2://i86bi-linux-l3-15.2-4M5.bin"
+
+cisco IOL (PT1005) processor (revision 1.0) with 1048576K/65536K bytes of memory.
+Processor board ID 5259066692
+1 Gigabit Ethernet interface
+32K bytes of non-volatile configuration memory.
+8388608K bytes of ATA System CompactFlash 0 (Read/Write)
+Configuration register is 0x100

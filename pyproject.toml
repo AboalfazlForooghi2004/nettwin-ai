@@ -21,6 +21,13 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.4",
 ]
+# Phase-2 read-only collector (opt-in; core install stays unchanged).
+# Rationale: Python has no stdlib SSH client; netmiko is the de-facto
+# standard for Cisco IOS (supports cisco_ios / IOS 15.2) and handles
+# prompt detection + paging. Install with: pip install -e ".[collect]"
+collect = [
+    "netmiko>=4.3",
+]
 
 [project.scripts]
 nettwin = "nettwin.main:main"

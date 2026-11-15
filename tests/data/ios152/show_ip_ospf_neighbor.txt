@@ -1,0 +1,4 @@
+Neighbor ID     Pri State           Dead Time   Address         Interface
+10.255.255.31    1 FULL/DR         00:00:34    10.0.21.1       Ethernet0/0
+10.255.255.2     1 FULL/DROTHER    00:00:37    10.0.12.5       Ethernet0/2
+10.255.255.1     1 FULL/BDR        00:00:32    10.0.12.6       Ethernet0/2
