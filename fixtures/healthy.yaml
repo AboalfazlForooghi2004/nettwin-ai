@@ -1,0 +1,209 @@
+# NetTwin AI fixture: healthy multi-tenant topology.
+#
+# TENANT_A and TENANT_B both use 10.10.10.0/24 — isolated by VRF.
+# Shared service: PostgreSQL at 10.100.1.20 in VRF SERVICE, with access from
+# both tenant VRFs explicitly allowed by `svc-postgres.allowed_vrfs`.
+# There is no implicit route leaking between tenant VRFs.
+
+devices:
+  - id: leaf-a1
+    name: Tenant A Leaf 1
+    vendor: acme
+    platform: vxlan-leaf
+    metadata:
+      role: leaf
+      tenant: tenant-a
+  - id: leaf-b1
+    name: Tenant B Leaf 1
+    vendor: acme
+    platform: vxlan-leaf
+    metadata:
+      role: leaf
+      tenant: tenant-b
+  - id: edge-a1
+    name: Edge Router 1
+    vendor: acme
+    platform: router
+    metadata:
+      role: edge
+  - id: svc-leaf
+    name: Service Leaf 1
+    vendor: acme
+    platform: vxlan-leaf
+    metadata:
+      role: services
+
+vrfs:
+  - id: TENANT_A
+    name: TENANT_A
+    tenant_id: tenant-a
+    description: Tenant A private network
+  - id: TENANT_B
+    name: TENANT_B
+    tenant_id: tenant-b
+    description: Tenant B private network
+  - id: SERVICE
+    name: SERVICE
+    tenant_id: shared
+    description: Shared service network
+
+interfaces:
+  # --- Tenant A ---
+  - id: leaf-a1:eth0
+    device_id: leaf-a1
+    name: eth0
+    vrf_id: TENANT_A
+    ipv4_addresses: [10.10.10.1/24]
+    admin_state: up
+    oper_state: up
+  - id: leaf-a1:eth1
+    device_id: leaf-a1
+    name: eth1
+    vrf_id: TENANT_A
+    ipv4_addresses: [10.100.10.1/30]
+    admin_state: up
+    oper_state: up
+  # --- Tenant B (10.10.10.1/24 overlaps with Tenant A by design) ---
+  - id: leaf-b1:eth0
+    device_id: leaf-b1
+    name: eth0
+    vrf_id: TENANT_B
+    ipv4_addresses: [10.10.10.1/24]
+    admin_state: up
+    oper_state: up
+  - id: leaf-b1:eth1
+    device_id: leaf-b1
+    name: eth1
+    vrf_id: TENANT_B
+    ipv4_addresses: [10.100.20.1/30]
+    admin_state: up
+    oper_state: up
+  # --- Edge (runs all three VRFs) ---
+  - id: edge-a1:eth1
+    device_id: edge-a1
+    name: eth1
+    vrf_id: TENANT_A
+    ipv4_addresses: [10.100.10.2/30]
+    admin_state: up
+    oper_state: up
+  - id: edge-a1:eth2
+    device_id: edge-a1
+    name: eth2
+    vrf_id: TENANT_B
+    ipv4_addresses: [10.100.20.2/30]
+    admin_state: up
+    oper_state: up
+  - id: edge-a1:eth3
+    device_id: edge-a1
+    name: eth3
+    vrf_id: SERVICE
+    ipv4_addresses: [10.100.1.1/24]
+    admin_state: up
+    oper_state: up
+  # --- Service leaf ---
+  - id: svc-leaf:eth0
+    device_id: svc-leaf
+    name: eth0
+    vrf_id: SERVICE
+    ipv4_addresses: [10.100.1.254/24]
+    admin_state: up
+    oper_state: up
+
+links:
+  - id: link-a-uplink
+    source_interface_id: leaf-a1:eth1
+    destination_interface_id: edge-a1:eth1
+    state: up
+  - id: link-b-uplink
+    source_interface_id: leaf-b1:eth1
+    destination_interface_id: edge-a1:eth2
+    state: up
+  - id: link-svc
+    source_interface_id: edge-a1:eth3
+    destination_interface_id: svc-leaf:eth0
+    state: up
+
+routes:
+  # Tenant A leaf
+  - id: leaf-a1-conn-10-10-10
+    device_id: leaf-a1
+    vrf_id: TENANT_A
+    destination_prefix: 10.10.10.0/24
+    outgoing_interface_id: leaf-a1:eth0
+    protocol: connected
+    active: true
+  - id: leaf-a1-svc-10-100-1
+    device_id: leaf-a1
+    vrf_id: TENANT_A
+    destination_prefix: 10.100.1.0/24
+    next_hop: 10.100.10.2
+    outgoing_interface_id: leaf-a1:eth1
+    protocol: static
+    active: true
+  # Edge in TENANT_A: explicit service handoff into VRF SERVICE
+  - id: edge-a1-tenanta-svc-10-100-1
+    device_id: edge-a1
+    vrf_id: TENANT_A
+    destination_prefix: 10.100.1.0/24
+    next_hop: 10.100.1.254
+    outgoing_interface_id: edge-a1:eth3
+    protocol: static
+    active: true
+  # Tenant B leaf
+  - id: leaf-b1-conn-10-10-10
+    device_id: leaf-b1
+    vrf_id: TENANT_B
+    destination_prefix: 10.10.10.0/24
+    outgoing_interface_id: leaf-b1:eth0
+    protocol: connected
+    active: true
+  - id: leaf-b1-svc-10-100-1
+    device_id: leaf-b1
+    vrf_id: TENANT_B
+    destination_prefix: 10.100.1.0/24
+    next_hop: 10.100.20.2
+    outgoing_interface_id: leaf-b1:eth1
+    protocol: static
+    active: true
+  # Edge in TENANT_B: explicit service handoff into VRF SERVICE
+  - id: edge-a1-tenantb-svc-10-100-1
+    device_id: edge-a1
+    vrf_id: TENANT_B
+    destination_prefix: 10.100.1.0/24
+    next_hop: 10.100.1.254
+    outgoing_interface_id: edge-a1:eth3
+    protocol: static
+    active: true
+  # Service leaf
+  - id: svc-leaf-conn-10-100-1
+    device_id: svc-leaf
+    vrf_id: SERVICE
+    destination_prefix: 10.100.1.0/24
+    outgoing_interface_id: svc-leaf:eth0
+    protocol: connected
+    active: true
+
+endpoints:
+  - id: ep-a-app
+    name: Tenant A Application
+    ip_address: 10.10.10.10
+    vrf_id: TENANT_A
+    device_id: leaf-a1
+  - id: ep-b-app
+    name: Tenant B Application
+    ip_address: 10.10.10.10 # same IP as ep-a-app, different VRF
+    vrf_id: TENANT_B
+    device_id: leaf-b1
+  - id: ep-pg
+    name: PostgreSQL Backend
+    ip_address: 10.100.1.20
+    vrf_id: SERVICE
+    device_id: svc-leaf
+
+services:
+  - id: svc-postgres
+    name: PostgreSQL
+    endpoint_id: ep-pg
+    protocol: tcp
+    port: 5432
+    allowed_vrfs: [TENANT_A, TENANT_B]

@@ -1,0 +1,418 @@
+# NetTwin AI fixture: HQ lab topology with a MISSING ROUTE.
+#
+# Identical to lab_hq.yaml except route `r-blue-to-dmz` (10.100.0.0/24
+# via 10.10.10.1 on sw-blue-1 in VRF BLUE) has been removed. Therefore:
+#   - pc-blue  -> web-dmz : UNREACHABLE (MISSING_ROUTE)
+#   - pc-green -> web-dmz : still reachable
+#   - pc-branch-> web-dmz : still reachable
+#
+devices:
+  - id: sw-blue-1
+    name: HQ Access Switch Blue
+    vendor: acme
+    platform: iosxe
+    management_address: 192.168.100.21
+    metadata: {role: access, zone: blue, site: hq}
+  - id: sw-green-1
+    name: HQ Access Switch Green
+    vendor: acme
+    platform: iosxe
+    management_address: 192.168.100.22
+    metadata: {role: access, zone: green, site: hq}
+  - id: sw-core-1
+    name: HQ Core Switch
+    vendor: acme
+    platform: nxos
+    management_address: 192.168.100.11
+    metadata: {role: core, site: hq}
+  - id: sw-dmz-1
+    name: HQ DMZ Switch
+    vendor: acme
+    platform: nxos
+    management_address: 192.168.100.23
+    metadata: {role: dmz-access, site: hq}
+  - id: fw-edge-1
+    name: HQ Edge Firewall
+    vendor: fortinet
+    platform: fortios
+    management_address: 192.168.100.1
+    metadata: {role: edge-firewall, site: hq}
+  - id: fw-branch-1
+    name: Branch Firewall
+    vendor: fortinet
+    platform: fortios
+    management_address: 192.168.100.2
+    metadata: {role: branch-firewall, site: branch}
+
+vrfs:
+  - id: BLUE
+    name: BLUE
+    tenant_id: tenant-blue
+    description: Blue zone users (10.10.1.0/24)
+  - id: GREEN
+    name: GREEN
+    tenant_id: tenant-green
+    description: Green zone users (10.10.1.0/24, overlaps BLUE by design)
+  - id: DMZ
+    name: DMZ
+    tenant_id: shared-services
+    description: Published services (10.100.0.0/24)
+  - id: BRANCH
+    name: BRANCH
+    tenant_id: tenant-branch
+    description: Branch site (10.30.1.0/24), extended over the WAN tunnel
+  - id: MGMT
+    name: MGMT
+    tenant_id: infrastructure
+    description: Out-of-band management (192.168.100.0/24), no forwarding
+
+interfaces:
+  # --- sw-blue-1 ---
+  - id: sw-blue-1:eth0
+    device_id: sw-blue-1
+    name: eth0
+    vrf_id: BLUE
+    ipv4_addresses: [10.10.1.1/24]      # PC Blue default gateway
+    admin_state: up
+    oper_state: up
+  - id: sw-blue-1:eth10
+    device_id: sw-blue-1
+    name: eth10
+    vrf_id: BLUE
+    ipv4_addresses: [10.10.10.2/30]     # uplink to sw-core-1
+    admin_state: up
+    oper_state: up
+  - id: sw-blue-1:mgmt
+    device_id: sw-blue-1
+    name: mgmt
+    vrf_id: MGMT
+    ipv4_addresses: [192.168.100.21/24]
+    admin_state: up
+    oper_state: up
+  # --- sw-green-1 ---
+  - id: sw-green-1:eth0
+    device_id: sw-green-1
+    name: eth0
+    vrf_id: GREEN
+    ipv4_addresses: [10.10.1.1/24]      # overlaps BLUE gateway by design
+    admin_state: up
+    oper_state: up
+  - id: sw-green-1:eth10
+    device_id: sw-green-1
+    name: eth10
+    vrf_id: GREEN
+    ipv4_addresses: [10.10.20.2/30]     # uplink to sw-core-1
+    admin_state: up
+    oper_state: up
+  - id: sw-green-1:mgmt
+    device_id: sw-green-1
+    name: mgmt
+    vrf_id: MGMT
+    ipv4_addresses: [192.168.100.22/24]
+    admin_state: up
+    oper_state: up
+  # --- sw-core-1 ---
+  - id: sw-core-1:eth1
+    device_id: sw-core-1
+    name: eth1
+    vrf_id: BLUE
+    ipv4_addresses: [10.10.10.1/30]
+    admin_state: up
+    oper_state: up
+  - id: sw-core-1:eth2
+    device_id: sw-core-1
+    name: eth2
+    vrf_id: GREEN
+    ipv4_addresses: [10.10.20.1/30]
+    admin_state: up
+    oper_state: up
+  - id: sw-core-1:eth3
+    device_id: sw-core-1
+    name: eth3
+    vrf_id: BLUE
+    ipv4_addresses: [10.10.11.2/30]
+    admin_state: up
+    oper_state: up
+  - id: sw-core-1:eth4
+    device_id: sw-core-1
+    name: eth4
+    vrf_id: GREEN
+    ipv4_addresses: [10.10.21.2/30]
+    admin_state: up
+    oper_state: up
+  - id: sw-core-1:mgmt
+    device_id: sw-core-1
+    name: mgmt
+    vrf_id: MGMT
+    ipv4_addresses: [192.168.100.11/24]
+    admin_state: up
+    oper_state: up
+  # --- sw-dmz-1 ---
+  - id: sw-dmz-1:eth1
+    device_id: sw-dmz-1
+    name: eth1
+    vrf_id: DMZ
+    ipv4_addresses: [10.100.0.2/24]
+    admin_state: up
+    oper_state: up
+  - id: sw-dmz-1:mgmt
+    device_id: sw-dmz-1
+    name: mgmt
+    vrf_id: MGMT
+    ipv4_addresses: [192.168.100.23/24]
+    admin_state: up
+    oper_state: up
+  # --- fw-edge-1 ---
+  - id: fw-edge-1:eth-blue
+    device_id: fw-edge-1
+    name: eth-blue
+    vrf_id: BLUE
+    ipv4_addresses: [10.10.11.1/30]
+    admin_state: up
+    oper_state: up
+  - id: fw-edge-1:eth-green
+    device_id: fw-edge-1
+    name: eth-green
+    vrf_id: GREEN
+    ipv4_addresses: [10.10.21.1/30]
+    admin_state: up
+    oper_state: up
+  - id: fw-edge-1:eth-dmz
+    device_id: fw-edge-1
+    name: eth-dmz
+    vrf_id: DMZ
+    ipv4_addresses: [10.100.0.1/24]
+    admin_state: up
+    oper_state: up
+  - id: fw-edge-1:eth-wan
+    device_id: fw-edge-1
+    name: eth-wan
+    vrf_id: BRANCH
+    ipv4_addresses: [172.16.0.1/30]     # WAN tunnel end (BRANCH VRF)
+    admin_state: up
+    oper_state: up
+  - id: fw-edge-1:mgmt
+    device_id: fw-edge-1
+    name: mgmt
+    vrf_id: MGMT
+    ipv4_addresses: [192.168.100.1/24]
+    admin_state: up
+    oper_state: up
+  # --- fw-branch-1 ---
+  - id: fw-branch-1:eth-wan
+    device_id: fw-branch-1
+    name: eth-wan
+    vrf_id: BRANCH
+    ipv4_addresses: [172.16.0.2/30]     # WAN tunnel end (BRANCH VRF)
+    admin_state: up
+    oper_state: up
+  - id: fw-branch-1:eth-lan
+    device_id: fw-branch-1
+    name: eth-lan
+    vrf_id: BRANCH
+    ipv4_addresses: [10.30.1.1/24]      # PC Branch default gateway
+    admin_state: up
+    oper_state: up
+  - id: fw-branch-1:mgmt
+    device_id: fw-branch-1
+    name: mgmt
+    vrf_id: MGMT
+    ipv4_addresses: [192.168.100.2/24]
+    admin_state: up
+    oper_state: up
+
+links:
+  - id: lnk-blue-uplink
+    source_interface_id: sw-blue-1:eth10
+    destination_interface_id: sw-core-1:eth1
+    state: up
+  - id: lnk-green-uplink
+    source_interface_id: sw-green-1:eth10
+    destination_interface_id: sw-core-1:eth2
+    state: up
+  - id: lnk-core-to-fw-blue
+    source_interface_id: sw-core-1:eth3
+    destination_interface_id: fw-edge-1:eth-blue
+    state: up
+  - id: lnk-core-to-fw-green
+    source_interface_id: sw-core-1:eth4
+    destination_interface_id: fw-edge-1:eth-green
+    state: up
+  - id: lnk-fw-to-dmz
+    source_interface_id: fw-edge-1:eth-dmz
+    destination_interface_id: sw-dmz-1:eth1
+    state: up
+  - id: lnk-wan-tunnel
+    source_interface_id: fw-branch-1:eth-wan
+    destination_interface_id: fw-edge-1:eth-wan
+    state: up
+
+routes:
+  # ===== BLUE =====
+  - id: r-blue-svi
+    device_id: sw-blue-1
+    vrf_id: BLUE
+    destination_prefix: 10.10.1.0/24
+    outgoing_interface_id: sw-blue-1:eth0
+    protocol: connected
+    active: true
+  - id: r-core-blue-conn
+    device_id: sw-core-1
+    vrf_id: BLUE
+    destination_prefix: 10.10.10.0/30
+    outgoing_interface_id: sw-core-1:eth1
+    protocol: connected
+    active: true
+  - id: r-core-blue-to-dmz
+    device_id: sw-core-1
+    vrf_id: BLUE
+    destination_prefix: 10.100.0.0/24
+    next_hop: 10.10.11.1               # fw-edge-1:eth-blue
+    outgoing_interface_id: sw-core-1:eth3
+    protocol: static
+    active: true
+  - id: r-fw-blue-conn
+    device_id: fw-edge-1
+    vrf_id: BLUE
+    destination_prefix: 10.10.11.0/30
+    outgoing_interface_id: fw-edge-1:eth-blue
+    protocol: connected
+    active: true
+  - id: r-fw-blue-to-dmz
+    device_id: fw-edge-1
+    vrf_id: BLUE
+    destination_prefix: 10.100.0.0/24
+    next_hop: 10.100.0.2               # sw-dmz-1 — service handoff into DMZ
+    outgoing_interface_id: fw-edge-1:eth-dmz
+    protocol: static
+    active: true
+  # ===== GREEN =====
+  - id: r-green-svi
+    device_id: sw-green-1
+    vrf_id: GREEN
+    destination_prefix: 10.10.1.0/24
+    outgoing_interface_id: sw-green-1:eth0
+    protocol: connected
+    active: true
+  - id: r-green-to-dmz
+    device_id: sw-green-1
+    vrf_id: GREEN
+    destination_prefix: 10.100.0.0/24
+    next_hop: 10.10.20.1               # sw-core-1:eth2
+    outgoing_interface_id: sw-green-1:eth10
+    protocol: static
+    active: true
+  - id: r-core-green-conn
+    device_id: sw-core-1
+    vrf_id: GREEN
+    destination_prefix: 10.10.20.0/30
+    outgoing_interface_id: sw-core-1:eth2
+    protocol: connected
+    active: true
+  - id: r-core-green-to-dmz
+    device_id: sw-core-1
+    vrf_id: GREEN
+    destination_prefix: 10.100.0.0/24
+    next_hop: 10.10.21.1               # fw-edge-1:eth-green
+    outgoing_interface_id: sw-core-1:eth4
+    protocol: static
+    active: true
+  - id: r-fw-green-conn
+    device_id: fw-edge-1
+    vrf_id: GREEN
+    destination_prefix: 10.10.21.0/30
+    outgoing_interface_id: fw-edge-1:eth-green
+    protocol: connected
+    active: true
+  - id: r-fw-green-to-dmz
+    device_id: fw-edge-1
+    vrf_id: GREEN
+    destination_prefix: 10.100.0.0/24
+    next_hop: 10.100.0.2               # sw-dmz-1 — service handoff into DMZ
+    outgoing_interface_id: fw-edge-1:eth-dmz
+    protocol: static
+    active: true
+  # ===== DMZ =====
+  - id: r-dmz-sw-conn
+    device_id: sw-dmz-1
+    vrf_id: DMZ
+    destination_prefix: 10.100.0.0/24
+    outgoing_interface_id: sw-dmz-1:eth1
+    protocol: connected
+    active: true
+  - id: r-fw-dmz-conn
+    device_id: fw-edge-1
+    vrf_id: DMZ
+    destination_prefix: 10.100.0.0/24
+    outgoing_interface_id: fw-edge-1:eth-dmz
+    protocol: connected
+    active: true
+  # ===== BRANCH =====
+  - id: r-branch-lan
+    device_id: fw-branch-1
+    vrf_id: BRANCH
+    destination_prefix: 10.30.1.0/24
+    outgoing_interface_id: fw-branch-1:eth-lan
+    protocol: connected
+    active: true
+  - id: r-branch-wan-conn
+    device_id: fw-branch-1
+    vrf_id: BRANCH
+    destination_prefix: 172.16.0.0/30
+    outgoing_interface_id: fw-branch-1:eth-wan
+    protocol: connected
+    active: true
+  - id: r-branch-to-dmz
+    device_id: fw-branch-1
+    vrf_id: BRANCH
+    destination_prefix: 10.100.0.0/24
+    next_hop: 172.16.0.1               # fw-edge-1 tunnel end
+    outgoing_interface_id: fw-branch-1:eth-wan
+    protocol: static
+    active: true
+  - id: r-fw-branch-wan-conn
+    device_id: fw-edge-1
+    vrf_id: BRANCH
+    destination_prefix: 172.16.0.0/30
+    outgoing_interface_id: fw-edge-1:eth-wan
+    protocol: connected
+    active: true
+  - id: r-fw-branch-to-dmz
+    device_id: fw-edge-1
+    vrf_id: BRANCH
+    destination_prefix: 10.100.0.0/24
+    next_hop: 10.100.0.2               # sw-dmz-1 — service handoff into DMZ
+    outgoing_interface_id: fw-edge-1:eth-dmz
+    protocol: static
+    active: true
+  # ===== MGMT (out-of-band: intentionally no routes) =====
+
+endpoints:
+  - id: pc-blue
+    name: PC Blue
+    ip_address: 10.10.1.10
+    vrf_id: BLUE
+    device_id: sw-blue-1
+  - id: pc-green
+    name: PC Green
+    ip_address: 10.10.1.10           # same IP as pc-blue, different VRF
+    vrf_id: GREEN
+    device_id: sw-green-1
+  - id: web-dmz
+    name: Web Portal Backend
+    ip_address: 10.100.0.10
+    vrf_id: DMZ
+    device_id: sw-dmz-1
+  - id: pc-branch
+    name: PC Branch
+    ip_address: 10.30.1.10
+    vrf_id: BRANCH
+    device_id: fw-branch-1
+
+services:
+  - id: svc-web
+    name: Web Portal
+    endpoint_id: web-dmz
+    protocol: tcp
+    port: 443
+    allowed_vrfs: [BLUE, GREEN, BRANCH]

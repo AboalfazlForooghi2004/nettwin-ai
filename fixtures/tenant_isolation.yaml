@@ -1,0 +1,125 @@
+# NetTwin AI fixture: tenant-isolation topology.
+#
+# TENANT_A and TENANT_B both use 10.10.10.0/24 (and both host an endpoint at
+# 10.10.10.10). There is NO shared service and NO cross-VRF route: the only
+# routes are connected routes inside each tenant's own VRF. Any request to
+# cross from one tenant VRF to the other must be rejected as a tenant
+# isolation violation — connectivity must never be inferred from matching
+# IP addresses.
+
+devices:
+  - id: leaf-a1
+    name: Tenant A Leaf 1
+    vendor: acme
+    platform: vxlan-leaf
+    metadata:
+      role: leaf
+      tenant: tenant-a
+  - id: leaf-b1
+    name: Tenant B Leaf 1
+    vendor: acme
+    platform: vxlan-leaf
+    metadata:
+      role: leaf
+      tenant: tenant-b
+  - id: edge-a1
+    name: Edge Router 1
+    vendor: acme
+    platform: router
+    metadata:
+      role: edge
+
+vrfs:
+  - id: TENANT_A
+    name: TENANT_A
+    tenant_id: tenant-a
+    description: Tenant A private network
+  - id: TENANT_B
+    name: TENANT_B
+    tenant_id: tenant-b
+    description: Tenant B private network
+
+interfaces:
+  - id: leaf-a1:eth0
+    device_id: leaf-a1
+    name: eth0
+    vrf_id: TENANT_A
+    ipv4_addresses: [10.10.10.1/24]
+    admin_state: up
+    oper_state: up
+  - id: leaf-a1:eth1
+    device_id: leaf-a1
+    name: eth1
+    vrf_id: TENANT_A
+    ipv4_addresses: [10.100.10.1/30]
+    admin_state: up
+    oper_state: up
+  - id: leaf-b1:eth0
+    device_id: leaf-b1
+    name: eth0
+    vrf_id: TENANT_B
+    ipv4_addresses: [10.10.10.1/24]
+    admin_state: up
+    oper_state: up
+  - id: leaf-b1:eth1
+    device_id: leaf-b1
+    name: eth1
+    vrf_id: TENANT_B
+    ipv4_addresses: [10.100.20.1/30]
+    admin_state: up
+    oper_state: up
+  # Shared edge device: runs both tenant VRFs, but nothing crosses between them.
+  - id: edge-a1:eth1
+    device_id: edge-a1
+    name: eth1
+    vrf_id: TENANT_A
+    ipv4_addresses: [10.100.10.2/30]
+    admin_state: up
+    oper_state: up
+  - id: edge-a1:eth2
+    device_id: edge-a1
+    name: eth2
+    vrf_id: TENANT_B
+    ipv4_addresses: [10.100.20.2/30]
+    admin_state: up
+    oper_state: up
+
+links:
+  - id: link-a-uplink
+    source_interface_id: leaf-a1:eth1
+    destination_interface_id: edge-a1:eth1
+    state: up
+  - id: link-b-uplink
+    source_interface_id: leaf-b1:eth1
+    destination_interface_id: edge-a1:eth2
+    state: up
+
+routes:
+  - id: leaf-a1-conn-10-10-10
+    device_id: leaf-a1
+    vrf_id: TENANT_A
+    destination_prefix: 10.10.10.0/24
+    outgoing_interface_id: leaf-a1:eth0
+    protocol: connected
+    active: true
+  - id: leaf-b1-conn-10-10-10
+    device_id: leaf-b1
+    vrf_id: TENANT_B
+    destination_prefix: 10.10.10.0/24
+    outgoing_interface_id: leaf-b1:eth0
+    protocol: connected
+    active: true
+
+endpoints:
+  - id: ep-a-app
+    name: Tenant A Application
+    ip_address: 10.10.10.10
+    vrf_id: TENANT_A
+    device_id: leaf-a1
+  - id: ep-b-app
+    name: Tenant B Application
+    ip_address: 10.10.10.10 # deliberately identical to ep-a-app's IP
+    vrf_id: TENANT_B
+    device_id: leaf-b1
+
+services: []
