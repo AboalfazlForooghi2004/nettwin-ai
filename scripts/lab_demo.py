@@ -170,13 +170,25 @@ def run_llm_loop(models: list[str], timeout: float) -> tuple[bool, str]:
     except urllib.error.HTTPError as exc:
         hint = " — check LLM_API_KEY in .env (cp env.example .env)" if exc.code in (
             401, 403) else ""
-        print(f"  SKIPPED: gateway returned HTTP {exc.code}{hint}")
+        print(f"  SKIPPED: gateway returned HTTP {exc.code}{hint}: {exc}")
         return True, f"gateway HTTP {exc.code}"
     except Exception as exc:  # noqa: BLE001 - report any connectivity issue
         print(f"  SKIPPED: gateway unreachable from here ({type(exc).__name__}: {exc})")
         print("           Run this on the machine that can reach "
               f"{base_url} — deterministic part already passed.")
         return True, "gateway unreachable"
+
+    # Keep only models the gateway actually advertises; fall back to its list
+    # when configured ids went stale (gateways rename models over time).
+    advertised = set(gateway_models)
+    usable = [m for m in models if m in advertised]
+    stale = [m for m in models if m not in advertised]
+    if stale:
+        print(f"  note: configured ids not advertised: {', '.join(stale)}")
+    if not usable:
+        print("  falling back to the gateway's advertised model list")
+        usable = list(gateway_models)
+    models = usable
 
     # Ground truth from the engine (same MCP handlers).
     truth: dict[str, dict] = {}

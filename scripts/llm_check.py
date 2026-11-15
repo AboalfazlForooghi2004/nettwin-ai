@@ -60,8 +60,15 @@ def _request(
         },
         method="POST" if payload is not None else "GET",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # Surface the gateway's error body (the reason for 401/403/400...).
+        detail = exc.read().decode("utf-8", errors="replace")[:600]
+        raise urllib.error.HTTPError(
+            exc.url, exc.code, f"{exc.reason} — {detail}", exc.headers, exc.fp
+        ) from None
 
 
 def list_models(base_url: str, api_key: str, timeout: float = 30) -> list[str]:
