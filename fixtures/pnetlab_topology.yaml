@@ -1,0 +1,390 @@
+# NetTwin AI — PNETLab real-topology fixture (Phase 1, approved 2026-11-15)
+#
+# Status: INTEGRATED for fixture-based testing (Mode 1). Promoted from
+#         proposed/ per Phase-1 approval; provenance and assumptions below
+#         are unchanged. Live-collector comparison (G4) is still pending.
+# Provenance (evidence classes):
+#   [DEVICE]  OSPF neighbor tables captured from R2-3 / R2-1 (user relayed)
+#   [USER]    link/IP/loopback inventory, OSPF FULL state, corrected
+#             IP-to-interface assignments, CDP-verified cabling, IOS 15.2
+#   [GAP]     data NOT supplied by the brief — marked inline, never invented
+#   [ASSUMP]  equal-cost paths: engine supports ONE next_hop per route
+#             (BASE_LIMITATIONS: "no ECMP") → a representative next hop was
+#             chosen where ECMP is likely; confirm actual FIB at G4
+#
+# Modeling decisions (schema-conformant, see PNETLAB_PREPARATION_REPORT.md §3):
+#   * Single VRF "GLOBAL" — the lab runs one flat OSPF table (no VRFs given).
+#     Every interface carries vrf_id (the engine's VRF-handoff check requires
+#     peer interfaces to share the walk's VRF).
+#   * R2 (multilayer switch): L3 view only — Links terminate on the SVIs that
+#     carry the /30 addresses (Vlan12/13/23). Known physical access port
+#     Ethernet0/2 ∈ VLAN23 is inventoried as an unlinked L2 interface.
+#     [GAP] physical access ports for VLAN12/VLAN13 not specified.
+#   * Loopbacks are interfaces AND connected /32 routes; loopback endpoints
+#     provide deterministic end-to-end test targets.
+#   * FortiGate default routes OMITTED: next-hop not supplied [GAP].
+#     FortiGate management addresses not supplied [GAP].
+#   * OSPF area/process/adjacency state: schema has no field for it [GAP-
+#     SCHEMA]; route.protocol="ospf" is the only representable OSPF fact.
+#   * No schema-level "version" key: Topology is extra="forbid" [GAP-SCHEMA
+#     observation] — provenance lives in this header comment instead.
+
+devices:
+  # --- Core Layer 3 switch [USER] ---
+  - id: r2
+    name: R2
+    vendor: cisco
+    platform: ios
+    metadata:
+      role: core-layer3-switch
+      mgmt_note: "SVI-based design; Loopback0 is the management anchor [ASSUMP]"
+
+  # --- Cisco IOL routers, IOS 15.2 [USER] ---
+  - id: r2-1
+    name: R2-1
+    vendor: cisco
+    platform: ios
+    management_address: 10.255.255.1
+    metadata:
+      role: router
+      os: "IOS 15.2 (Cisco IOL)"
+      external_gateway: true          # E0/2 -> PNETLab external network
+
+  - id: r2-2
+    name: R2-2
+    vendor: cisco
+    platform: ios
+    management_address: 10.255.255.3
+    metadata:
+      role: router
+      os: "IOS 15.2 (Cisco IOL)"
+
+  - id: r2-3
+    name: R2-3
+    vendor: cisco
+    platform: ios
+    management_address: 10.255.255.4
+    metadata:
+      role: router
+      os: "IOS 15.2 (Cisco IOL)"
+
+  - id: r2-4
+    name: R2-4
+    vendor: cisco
+    platform: ios
+    management_address: 10.255.255.5
+    metadata:
+      role: router
+      os: "IOS 15.2 (Cisco IOL)"
+
+  # --- FortiGate VMs [USER] ---
+  - id: fortigate
+    name: FortiGate
+    vendor: fortinet
+    platform: fortios
+    # management_address: [GAP] not supplied
+    metadata:
+      role: firewall
+      license_vcpu: 1                 # VM must stay within license [USER]
+      license_ram_mb: 2048
+
+  - id: fortigate-1
+    name: FortiGate-1
+    vendor: fortinet
+    platform: fortios
+    # management_address: [GAP] not supplied
+    metadata:
+      role: firewall
+      license_vcpu: 1
+      license_ram_mb: 2048
+
+vrfs:
+  - id: GLOBAL
+    name: default
+    tenant_id: null                   # single flat routing table [USER]
+    description: "Lab-wide OSPF routing table (no VRFs configured in lab)."
+
+interfaces:
+  # ---- R2 (core switch): SVIs + loopback + known L2 access port ----
+  - id: r2-vlan12
+    device_id: r2
+    name: Vlan12
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.12.1/30]
+    admin_state: up
+    oper_state: up
+  - id: r2-vlan13
+    device_id: r2
+    name: Vlan13
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.12.5/30]
+    admin_state: up
+    oper_state: up
+  - id: r2-vlan23
+    device_id: r2
+    name: Vlan23
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.23.1/30]
+    admin_state: up
+    oper_state: up
+  - id: r2-lo0
+    device_id: r2
+    name: Loopback0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.255.255.2/32]
+    admin_state: up
+    oper_state: up
+  - id: r2-e02                            # physical access port of VLAN23 [USER]
+    device_id: r2
+    name: Ethernet0/2
+    vrf_id: GLOBAL
+    ipv4_addresses: []                    # L2 port, no IP [USER]
+    admin_state: up
+    oper_state: up
+    # [GAP] access ports for Vlan12/Vlan13 not specified — not modeled.
+
+  # ---- R2-1 (external edge) ----
+  - id: r21-e00
+    device_id: r2-1
+    name: Ethernet0/0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.21.2/30]
+    admin_state: up
+    oper_state: up
+  - id: r21-e01
+    device_id: r2-1
+    name: Ethernet0/1
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.41.2/30]
+    admin_state: up
+    oper_state: up
+  - id: r21-e02
+    device_id: r2-1
+    name: Ethernet0/2
+    vrf_id: GLOBAL
+    ipv4_addresses: [192.168.98.34/27]    # external [USER]
+    admin_state: up
+    oper_state: up
+  - id: r21-lo0
+    device_id: r2-1
+    name: Loopback0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.255.255.1/32]
+    admin_state: up
+    oper_state: up
+
+  # ---- R2-2 ----
+  - id: r22-e00
+    device_id: r2-2
+    name: Ethernet0/0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.32.2/30]
+    admin_state: up
+    oper_state: up
+  - id: r22-e01
+    device_id: r2-2
+    name: Ethernet0/1
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.21.1/30]
+    admin_state: up
+    oper_state: up
+  - id: r22-lo0
+    device_id: r2-2
+    name: Loopback0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.255.255.3/32]
+    admin_state: up
+    oper_state: up
+
+  # ---- R2-3 ----
+  - id: r23-e00
+    device_id: r2-3
+    name: Ethernet0/0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.23.2/30]
+    admin_state: up
+    oper_state: up
+  - id: r23-e01
+    device_id: r2-3
+    name: Ethernet0/1
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.32.1/30]
+    admin_state: up
+    oper_state: up
+  - id: r23-e02
+    device_id: r2-3
+    name: Ethernet0/2
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.34.1/30]
+    admin_state: up
+    oper_state: up
+  - id: r23-lo0
+    device_id: r2-3
+    name: Loopback0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.255.255.4/32]
+    admin_state: up
+    oper_state: up
+
+  # ---- R2-4 ----
+  - id: r24-e00
+    device_id: r2-4
+    name: Ethernet0/0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.34.2/30]
+    admin_state: up
+    oper_state: up
+  - id: r24-e01
+    device_id: r2-4
+    name: Ethernet0/1
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.41.1/30]
+    admin_state: up
+    oper_state: up
+  - id: r24-lo0
+    device_id: r2-4
+    name: Loopback0
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.255.255.5/32]
+    admin_state: up
+    oper_state: up
+
+  # ---- FortiGates (port2 only — other ports [GAP]) ----
+  - id: fgt-p2
+    device_id: fortigate
+    name: port2
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.12.2/30]
+    admin_state: up
+    oper_state: up
+  - id: fgt1-p2
+    device_id: fortigate-1
+    name: port2
+    vrf_id: GLOBAL
+    ipv4_addresses: [10.0.12.6/30]
+    admin_state: up
+    oper_state: up
+
+links:
+  # L3 adjacency view: each Link joins the interfaces that carry the /30.
+  # On R2 the carrier is the SVI; the physical path (e.g. Ethernet0/2 in
+  # VLAN23) is L2 and does not appear as a Link endpoint.
+  - id: lnk-r2-r23
+    source_interface_id: r2-vlan23        # R2 E0/2 (VLAN23) <-> R2-3 E0/0 [USER]
+    destination_interface_id: r23-e00
+    state: up
+  - id: lnk-r23-r22
+    source_interface_id: r23-e01          # R2-3 E0/1 <-> R2-2 E0/0 [USER]
+    destination_interface_id: r22-e00
+    state: up
+  - id: lnk-r23-r24
+    source_interface_id: r23-e02          # R2-3 E0/2 <-> R2-4 E0/0 [USER]
+    destination_interface_id: r24-e00
+    state: up
+  - id: lnk-r24-r21
+    source_interface_id: r24-e01          # R2-4 E0/1 <-> R2-1 E0/1 [USER]
+    destination_interface_id: r21-e01
+    state: up
+  - id: lnk-r22-r21
+    source_interface_id: r22-e01          # R2-2 E0/1 <-> R2-1 E0/0 [USER]
+    destination_interface_id: r21-e00
+    state: up
+  - id: lnk-r2-fgt
+    source_interface_id: r2-vlan12        # R2 VLAN12 SVI <-> FortiGate port2 [USER]
+    destination_interface_id: fgt-p2
+    state: up
+  - id: lnk-r2-fgt1
+    source_interface_id: r2-vlan13        # R2 VLAN13 SVI <-> FortiGate-1 port2 [USER]
+    destination_interface_id: fgt1-p2
+    state: up
+
+routes:
+  # ============================ R2 (core switch) ============================
+  - {id: r2-c-10-0-12-0,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.12.0/30,     next_hop: null, outgoing_interface_id: r2-vlan12, protocol: connected, active: true}
+  - {id: r2-c-10-0-12-4,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.12.4/30,     next_hop: null, outgoing_interface_id: r2-vlan13, protocol: connected, active: true}
+  - {id: r2-c-10-0-23-0,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.23.0/30,     next_hop: null, outgoing_interface_id: r2-vlan23, protocol: connected, active: true}
+  - {id: r2-c-10-255-255-2, device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.255.255.2/32, next_hop: null, outgoing_interface_id: r2-lo0,    protocol: connected, active: true}
+  # R2's only IOL neighbor is R2-3 (10.0.23.2) — all remote OSPF routes via it.
+  - {id: r2-o-10-0-21-0,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.21.0/30,     next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-0-32-0,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.32.0/30,     next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-0-34-0,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.34.0/30,     next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-0-41-0,    device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.0.41.0/30,     next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-255-255-1, device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.255.255.1/32, next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-255-255-3, device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.255.255.3/32, next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-255-255-4, device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.255.255.4/32, next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+  - {id: r2-o-10-255-255-5, device_id: r2, vrf_id: GLOBAL, destination_prefix: 10.255.255.5/32, next_hop: 10.0.23.2, outgoing_interface_id: r2-vlan23, protocol: ospf, active: true}
+
+  # ============================== R2-3 =====================================
+  - {id: r23-c-10-0-23-0,    device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.0.23.0/30,     next_hop: null, outgoing_interface_id: r23-e00, protocol: connected, active: true}
+  - {id: r23-c-10-0-32-0,    device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.0.32.0/30,     next_hop: null, outgoing_interface_id: r23-e01, protocol: connected, active: true}
+  - {id: r23-c-10-0-34-0,    device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.0.34.0/30,     next_hop: null, outgoing_interface_id: r23-e02, protocol: connected, active: true}
+  - {id: r23-c-10-255-255-4, device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.255.255.4/32, next_hop: null, outgoing_interface_id: r23-lo0,  protocol: connected, active: true}
+  - {id: r23-o-10-255-255-2, device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.255.255.2/32, next_hop: 10.0.23.1, outgoing_interface_id: r23-e00, protocol: ospf, active: true}
+  - {id: r23-o-10-255-255-3, device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.255.255.3/32, next_hop: 10.0.32.2, outgoing_interface_id: r23-e01, protocol: ospf, active: true}
+  - {id: r23-o-10-255-255-5, device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.255.255.5/32, next_hop: 10.0.34.2, outgoing_interface_id: r23-e02, protocol: ospf, active: true}
+  # [ASSUMP] ECMP-likely to .1 — representative next hop via R2-2.
+  - {id: r23-o-10-255-255-1, device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.255.255.1/32, next_hop: 10.0.32.2, outgoing_interface_id: r23-e01, protocol: ospf, active: true}
+  - {id: r23-o-10-0-21-0,    device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.0.21.0/30,     next_hop: 10.0.32.2, outgoing_interface_id: r23-e01, protocol: ospf, active: true}
+  - {id: r23-o-10-0-41-0,    device_id: r2-3, vrf_id: GLOBAL, destination_prefix: 10.0.41.0/30,     next_hop: 10.0.34.2, outgoing_interface_id: r23-e02, protocol: ospf, active: true}
+
+  # ============================== R2-2 =====================================
+  - {id: r22-c-10-0-32-0,    device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.0.32.0/30,     next_hop: null, outgoing_interface_id: r22-e00, protocol: connected, active: true}
+  - {id: r22-c-10-0-21-0,    device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.0.21.0/30,     next_hop: null, outgoing_interface_id: r22-e01, protocol: connected, active: true}
+  - {id: r22-c-10-255-255-3, device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.255.255.3/32, next_hop: null, outgoing_interface_id: r22-lo0,  protocol: connected, active: true}
+  - {id: r22-o-10-255-255-4, device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.255.255.4/32, next_hop: 10.0.32.1, outgoing_interface_id: r22-e00, protocol: ospf, active: true}
+  - {id: r22-o-10-255-255-2, device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.255.255.2/32, next_hop: 10.0.32.1, outgoing_interface_id: r22-e00, protocol: ospf, active: true}
+  # [ASSUMP] ECMP-likely to .5 — representative next hop via R2-3.
+  - {id: r22-o-10-255-255-5, device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.255.255.5/32, next_hop: 10.0.32.1, outgoing_interface_id: r22-e00, protocol: ospf, active: true}
+  - {id: r22-o-10-255-255-1, device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.255.255.1/32, next_hop: 10.0.21.2, outgoing_interface_id: r22-e01, protocol: ospf, active: true}
+  - {id: r22-o-10-0-23-0,    device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.0.23.0/30,     next_hop: 10.0.32.1, outgoing_interface_id: r22-e00, protocol: ospf, active: true}
+  - {id: r22-o-10-0-34-0,    device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.0.34.0/30,     next_hop: 10.0.32.1, outgoing_interface_id: r22-e00, protocol: ospf, active: true}
+  - {id: r22-o-10-0-41-0,    device_id: r2-2, vrf_id: GLOBAL, destination_prefix: 10.0.41.0/30,     next_hop: 10.0.21.2, outgoing_interface_id: r22-e01, protocol: ospf, active: true}
+
+  # ============================== R2-4 =====================================
+  - {id: r24-c-10-0-34-0,    device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.0.34.0/30,     next_hop: null, outgoing_interface_id: r24-e00, protocol: connected, active: true}
+  - {id: r24-c-10-0-41-0,    device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.0.41.0/30,     next_hop: null, outgoing_interface_id: r24-e01, protocol: connected, active: true}
+  - {id: r24-c-10-255-255-5, device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.255.255.5/32, next_hop: null, outgoing_interface_id: r24-lo0,  protocol: connected, active: true}
+  - {id: r24-o-10-255-255-4, device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.255.255.4/32, next_hop: 10.0.34.1, outgoing_interface_id: r24-e00, protocol: ospf, active: true}
+  - {id: r24-o-10-255-255-2, device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.255.255.2/32, next_hop: 10.0.34.1, outgoing_interface_id: r24-e00, protocol: ospf, active: true}
+  # [ASSUMP] ECMP-likely to .3 — representative next hop via R2-3.
+  - {id: r24-o-10-255-255-3, device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.255.255.3/32, next_hop: 10.0.34.1, outgoing_interface_id: r24-e00, protocol: ospf, active: true}
+  - {id: r24-o-10-255-255-1, device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.255.255.1/32, next_hop: 10.0.41.2, outgoing_interface_id: r24-e01, protocol: ospf, active: true}
+  - {id: r24-o-10-0-23-0,    device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.0.23.0/30,     next_hop: 10.0.34.1, outgoing_interface_id: r24-e00, protocol: ospf, active: true}
+  - {id: r24-o-10-0-32-0,    device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.0.32.0/30,     next_hop: 10.0.34.1, outgoing_interface_id: r24-e00, protocol: ospf, active: true}
+  - {id: r24-o-10-0-21-0,    device_id: r2-4, vrf_id: GLOBAL, destination_prefix: 10.0.21.0/30,     next_hop: 10.0.41.2, outgoing_interface_id: r24-e01, protocol: ospf, active: true}
+
+  # ============================== R2-1 =====================================
+  - {id: r21-c-10-0-21-0,     device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.0.21.0/30,     next_hop: null, outgoing_interface_id: r21-e00, protocol: connected, active: true}
+  - {id: r21-c-10-0-41-0,     device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.0.41.0/30,     next_hop: null, outgoing_interface_id: r21-e01, protocol: connected, active: true}
+  - {id: r21-c-192-168-98-32, device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 192.168.98.32/27, next_hop: null, outgoing_interface_id: r21-e02, protocol: connected, active: true}
+  - {id: r21-c-10-255-255-1,  device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.255.255.1/32, next_hop: null, outgoing_interface_id: r21-lo0,  protocol: connected, active: true}
+  - {id: r21-o-10-255-255-3,  device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.255.255.3/32, next_hop: 10.0.21.1, outgoing_interface_id: r21-e00, protocol: ospf, active: true}
+  - {id: r21-o-10-255-255-5,  device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.255.255.5/32, next_hop: 10.0.41.1, outgoing_interface_id: r21-e01, protocol: ospf, active: true}
+  # [ASSUMP] ECMP-likely to .4 / .2 — representative next hops via R2-2.
+  - {id: r21-o-10-255-255-4,  device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.255.255.4/32, next_hop: 10.0.21.1, outgoing_interface_id: r21-e00, protocol: ospf, active: true}
+  - {id: r21-o-10-255-255-2,  device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.255.255.2/32, next_hop: 10.0.21.1, outgoing_interface_id: r21-e00, protocol: ospf, active: true}
+  - {id: r21-o-10-0-23-0,     device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.0.23.0/30,     next_hop: 10.0.21.1, outgoing_interface_id: r21-e00, protocol: ospf, active: true}
+  - {id: r21-o-10-0-32-0,     device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.0.32.0/30,     next_hop: 10.0.21.1, outgoing_interface_id: r21-e00, protocol: ospf, active: true}
+  - {id: r21-o-10-0-34-0,     device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 10.0.34.0/30,     next_hop: 10.0.41.1, outgoing_interface_id: r21-e01, protocol: ospf, active: true}
+  # External default route [USER] — gateway previously answered ping.
+  - {id: r21-s-default,       device_id: r2-1, vrf_id: GLOBAL, destination_prefix: 0.0.0.0/0,        next_hop: 192.168.98.62, outgoing_interface_id: r21-e02, protocol: static, active: true}
+
+  # ============================ FortiGates =================================
+  - {id: fgt-c-10-0-12-0,  device_id: fortigate,   vrf_id: GLOBAL, destination_prefix: 10.0.12.0/30, next_hop: null, outgoing_interface_id: fgt-p2,  protocol: connected, active: true}
+  - {id: fgt1-c-10-0-12-4, device_id: fortigate-1, vrf_id: GLOBAL, destination_prefix: 10.0.12.4/30, next_hop: null, outgoing_interface_id: fgt1-p2, protocol: connected, active: true}
+  # [GAP] FortiGate default routes omitted: next-hop not supplied by the brief.
+
+endpoints:
+  # Loopback endpoints = deterministic e2e test targets (from inventory).
+  - {id: ep-lo-r2,    name: R2 Loopback0,    ip_address: 10.255.255.2, vrf_id: GLOBAL, device_id: r2}
+  - {id: ep-lo-r2-1,  name: R2-1 Loopback0,  ip_address: 10.255.255.1, vrf_id: GLOBAL, device_id: r2-1}
+  - {id: ep-lo-r2-2,  name: R2-2 Loopback0,  ip_address: 10.255.255.3, vrf_id: GLOBAL, device_id: r2-2}
+  - {id: ep-lo-r2-3,  name: R2-3 Loopback0,  ip_address: 10.255.255.4, vrf_id: GLOBAL, device_id: r2-3}
+  - {id: ep-lo-r2-4,  name: R2-4 Loopback0,  ip_address: 10.255.255.5, vrf_id: GLOBAL, device_id: r2-4}
+  # FortiGate port2 probes: engine treats final on-link delivery without a
+  # next hop as INSUFFICIENT_DATA (no L2 neighbor model) — expected outcomes
+  # are UNVERIFIED until G4; see report §4.
+  - {id: ep-fgt-p2,   name: FortiGate port2,   ip_address: 10.0.12.2, vrf_id: GLOBAL, device_id: fortigate}
+  - {id: ep-fgt1-p2,  name: FortiGate-1 port2, ip_address: 10.0.12.6, vrf_id: GLOBAL, device_id: fortigate-1}
+
+services: []
