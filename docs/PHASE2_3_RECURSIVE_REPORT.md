@@ -6,7 +6,7 @@
 
 | Check | Result |
 |---|---|
-| `python -m pytest` | **342 passed** (274 + 39 recursive + 29 transport) |
+| `python -m pytest` | **353 passed** (274 + 41 recursive + 29 transport + 9 cdp-address) |
 | `python -m ruff check .` | **All checks passed!** |
 | `python scripts/lab_demo.py --no-llm` | **deterministic: PASS / llm loop: PASS** |
 | Domain schema / engine / graph / simulation | **0 files changed** |
@@ -262,6 +262,83 @@ use (`auth` / `timeout` / `refused` / `hostkey` / `unreachable`) and raised as
 (`connect` vs `nested ssh`). Eight cases are parametrised in the tests against
 real netmiko exception classes.
 
+## Fourth bug: a neighbour reachable only via `Management address(es)` became `<no-ip>`
+
+**Live evidence.** R2-3 *does* advertise addresses, and they are visible from
+two neighbours on two different links:
+
+| seen from | section | address |
+|---|---|---|
+| R2-2 | `Entry address(es)` | `10.0.32.1` |
+| R2-4 | `Entry address(es)` **and** `Management address(es)` | `10.0.34.1` |
+
+NetTwin reported `r2-3.nettwin.lab ... <no-ip>`.
+
+**Root cause — in the parser, not the network.** `parse_show_cdp_neighbors_detail`
+kept a `pending_version` flag that was set by `Version :` and cleared only by a
+block separator. A real IOS block puts the version body *before* the address
+sections:
+
+```
+Version :
+Cisco IOS Software, ...        <- collected
+advertisement version: 2       <- let through by a prefix check
+Management address(es):        <- swallowed by the version body
+  IP address: 10.0.34.1        <- swallowed by the version body
+```
+
+Every line after `Version :` that did not start with `advertisement` or
+`Capability codes` was appended to the version text and skipped. So the
+`Management address(es)` header and its IP were never matched. When a
+neighbour's only advertised address lived in that section, `ip_addresses` came
+back empty, the parser emitted *"advertises no IP address"*, and discovery
+created the node with `path=[..., "<no-ip>"]`, status `unreachable`, and never
+dialled it.
+
+Proven against the old code with the new fixture:
+
+```
+OLD -> R2-3.nettwin.lab: ips=[]
+       warning: "advertises no IP address — reachable only by name"
+NEW -> R2-3.nettwin.lab: ips=['10.0.34.1']   (management_addresses=['10.0.34.1'])
+```
+
+**Fix.** The version body now ends at the next section header
+(`Entry address(es)`, `Management address(es)`, `advertisement version`,
+`Capability codes`, `Platform:`, `Interface:`, `Holdtime :`, `Version :`), and
+each `IP address:` line is recorded under the section it appeared in:
+
+| field | meaning |
+|---|---|
+| `ip_addresses` | every address advertised, in order, deduplicated |
+| `entry_addresses` | the subset from `Entry address(es)` — the adjacency's own |
+| `management_addresses` | the subset from `Management address(es)` |
+
+**Choosing the address to dial** (`_pick_ip`) is still deterministic and never
+invents a value: first entry address, else first management address, else the
+first advertised address. Nothing is synthesised from a hostname or a subnet.
+
+**Two addresses, one device.** Every advertised address is registered in
+`IpAliases` against the same normalized identity, so mentioning either address
+later resolves to the same node. `DiscoveryEdge` gained `target_ips` (all
+addresses on that adjacency) while `target_ip` stays the single dialled
+address. Verified: R2-3 seen from both parents yields **one** node with
+`{'10.0.32.1', '10.0.34.1'}` recorded on its edges, and `collected` when the
+management-only path is used.
+
+**Fixtures and tests.** `tests/data/nested/` gained
+`r2-2_with_r2-3_detail.txt`, `r2-4_with_r2-3_management_only.txt`, and
+`r2-3_detail.txt`, built from the reported outputs. `tests/test_cdp_management_address.py`
+adds 9 tests (both sections extracted, no duplication when the address repeats,
+no leakage between blocks, version body not contaminated, a genuinely
+address-less neighbour still warns). `tests/test_recursive_discovery.py` adds
+2 discovery-level tests. `_make_discovery` gained `root_detail` so a different
+device can be the seed.
+
+**Safety unchanged.** The allowlist is still the same six read-only commands
+(guarded by its own test); no configuration command was added; no SSH check was
+weakened — a neighbour with no address at all is still flagged, not guessed.
+
 ## Limitations
 
 1. **No live lab validation.** The acceptance criterion
@@ -284,13 +361,14 @@ real netmiko exception classes.
 
 | Requirement | Status |
 |---|---|
-| Automated tests (68 new, 342 total) | ✅ complete |
+| Automated tests (79 new, 353 total) | ✅ complete |
 | CLI requiring only the seed | ✅ complete |
 | Duplicate prevention / cycle detection | ✅ tested |
 | Limits + explicit failure statuses | ✅ tested |
 | Transport `settimeout` crash (live bug) | ✅ **fixed, mocked regression added** |
 | Post-login prompt re-wait / redaction (live bugs) | ✅ **fixed, mocked regression added** |
 | Auth failure reported as a timeout | ✅ **fixed, mocked regression added** |
+| Neighbour with only `Management address(es)` → `<no-ip>` | ✅ **fixed, real-output fixtures** |
 | **Live `Ubuntu → R2-1 → R2-2 → R2-4`** | ❌ **not run — operator step** |
 
 > The transport fix is verified against the **installed** netmiko/paramiko

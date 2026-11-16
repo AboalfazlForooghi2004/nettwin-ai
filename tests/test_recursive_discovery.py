@@ -342,6 +342,7 @@ FAST = SessionLimits(
 def _make_discovery(
     *,
     root_name: str = "R2-1",
+    root_detail: str = "r2-1_detail.txt",
     nested: dict[str, tuple[str, str]],
     limits: SessionLimits | None = None,
     failing: dict[str, Exception] | None = None,
@@ -360,7 +361,9 @@ def _make_discovery(
     def root_factory(host: str, password: str) -> IosShellSession:
         return IosShellSession(
             host=host,
-            transport=root_transport(root_name, ssh_targets=ssh_targets),
+            transport=root_transport(
+                root_name, root_detail, ssh_targets=ssh_targets
+            ),
             limits=limits or FAST,
             username=USER,
             password=password,
@@ -673,3 +676,65 @@ def test_no_secret_in_any_discovery_warning() -> None:
     result = discovery.run()
     joined = "\n".join(result.warnings + [n.error or "" for n in result.nodes])
     assert PASS not in joined
+
+
+# --------------------------------------------------------------------------- #
+# Live regression: R2-3 advertises an address from two different neighbours.
+# --------------------------------------------------------------------------- #
+
+
+def test_13_r2_3_reaches_discovery_from_both_parents_as_one_device() -> None:
+    """R2-3 is ONE device, even though two parents advertise two addresses.
+
+    Live evidence from the PNETLab lab:
+
+      * from R2-2, R2-3's Entry address is 10.0.32.1
+      * from R2-4, R2-3's only advertised address is 10.0.34.1
+        (under Management address(es))
+
+    R2-4 is collected first here so the R2-4 path is the one that dials R2-3;
+    that is exactly the path that used to yield "<no-ip>". Requirement 3: two
+    advertised IPs must not become two devices.
+    """
+    discovery = _make_discovery(
+        root_name="R2-4",
+        root_detail="r2-4_with_r2-3_management_only.txt",
+        nested={
+            "10.0.21.1": ("R2-2", "r2-2_with_r2-3_detail.txt"),
+            "10.0.34.1": ("R2-3", "r2-3_detail.txt"),
+        },
+    )
+    result = discovery.run()
+
+    r2_3_nodes = [node for node in result.nodes if "r2-3" in node.identity]
+    assert len(r2_3_nodes) == 1, (
+        f"R2-3 became {len(r2_3_nodes)} nodes: {[n.identity for n in r2_3_nodes]}"
+    )
+    node = r2_3_nodes[0]
+    assert "<no-ip>" not in node.path, f"R2-3 was left unreachable: {node.path}"
+    assert node.path[-1] == "10.0.34.1", (
+        f"the management-only address was not used to reach R2-3: {node.path}"
+    )
+
+    # Both addresses seen for R2-3 are recorded, against the same identity.
+    edge_ips: set[str] = set()
+    for edge in result.edges:
+        if "r2-3" in edge.target:
+            edge_ips.update(edge.target_ips)
+    assert edge_ips == {"10.0.32.1", "10.0.34.1"}, (
+        f"expected both advertised addresses on the edges, got {edge_ips}"
+    )
+
+
+def test_14_management_only_address_produces_a_dialable_edge() -> None:
+    """An edge to a neighbour whose address is only in Management address(es)
+    still carries a concrete, non-invented address."""
+    discovery = _make_discovery(
+        root_name="R2-4",
+        root_detail="r2-4_with_r2-3_management_only.txt",
+        nested={"10.0.34.1": ("R2-3", "r2-3_detail.txt")},
+    )
+    result = discovery.run()
+    edges = [edge for edge in result.edges if "r2-3" in edge.target]
+    assert edges, "no edge to R2-3 was produced"
+    assert {edge.target_ip for edge in edges} == {"10.0.34.1"}

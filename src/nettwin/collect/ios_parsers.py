@@ -609,7 +609,14 @@ class CdpNeighborDetail:
     """
 
     device_id: str
+    #: Every address the neighbour advertised, in the order it appeared.
+    #: ``Entry address(es)`` and ``Management address(es)`` are both sources.
     ip_addresses: list[str] = field(default_factory=list)
+    #: The subset that came from ``Entry address(es)`` (the adjacency's own),
+    #: and from ``Management address(es)``. Kept apart so callers can prefer the
+    #: address that belongs to the link, and can still see both.
+    entry_addresses: list[str] = field(default_factory=list)
+    management_addresses: list[str] = field(default_factory=list)
     platform: str = ""
     capabilities: str = ""
     local_interface: str = ""   # normalized
@@ -629,6 +636,16 @@ _CDP_INTERFACE_RE = re.compile(
 )
 _CDP_HOLDTIME_RE = re.compile(r"^Holdtime\s*:\s*(?P<value>\d+)\s*sec")
 _CDP_VERSION_RE = re.compile(r"Version\s*:\s*$")
+#: Section headers that end a multi-line ``Version :`` body. Without this the
+#: version collector ran to the end of the block and swallowed the
+#: ``Management address(es)`` section (and its IPs) with it.
+_CDP_SECTION_RE = re.compile(
+    r"^(Entry address\(es\)|Management address\(es\)|advertisement version"
+    r"|Capability codes|Platform:|Interface:|Holdtime\s*:|Version\s*:)\b"
+)
+_CDP_ENTRY_HEADER_RE = re.compile(r"^Entry address\(es\)\s*:")
+_CDP_MGMT_HEADER_RE = re.compile(r"^Management address\(es\)\s*:")
+_CDP_ADVERT_HEADER_RE = re.compile(r"^advertisement version\s*:")
 
 
 def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail], list[str]]:
@@ -643,12 +660,18 @@ def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail],
     current: CdpNeighborDetail | None = None
     pending_version = False
     version_lines: list[str] = []
+    #: Which address section the next ``IP address:`` line belongs to.
+    #: ``None`` means "no section header seen yet"; bare ``IP address:`` lines
+    #: are then treated as entry addresses, which is the historical behaviour.
+    address_section: str | None = None
 
     def flush() -> None:
-        nonlocal current, pending_version, version_lines
+        nonlocal current, pending_version, version_lines, address_section
         if current is None:
             return
-        if pending_version and version_lines:
+        # ``pending_version`` is cleared as soon as the next section header
+        # appears, so the collected body is what matters here, not the flag.
+        if version_lines:
             current.software_version = version_lines[0].strip()
         if not current.device_id:
             warnings.append(
@@ -665,6 +688,7 @@ def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail],
         current = None
         pending_version = False
         version_lines = []
+        address_section = None
 
     for raw in text.splitlines():
         line = raw.rstrip()
@@ -674,9 +698,16 @@ def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail],
         if not line.strip():
             continue
 
+        stripped = line.strip()
         if pending_version:
-            stripped = line.strip()
-            if stripped and not stripped.startswith(("advertisement", "Capability codes")):
+            # ROOT CAUSE FIX: a multi-line Version body must stop at the next
+            # section header. Previously it ran to the end of the block and
+            # consumed ``Management address(es)`` and every IP under it, so a
+            # neighbour whose address only appeared there ended up with no
+            # addresses at all (reported as "<no-ip>").
+            if _CDP_SECTION_RE.match(stripped):
+                pending_version = False
+            elif stripped:
                 version_lines.append(stripped)
                 continue
 
@@ -684,13 +715,35 @@ def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail],
         if device_id:
             flush()
             current = CdpNeighborDetail(device_id=device_id.group("value").strip())
+            address_section = None
             continue
         if current is None:
             continue
 
+        # Section headers decide where the following ``IP address:`` lines go.
+        if _CDP_ENTRY_HEADER_RE.match(stripped):
+            address_section = "entry"
+            continue
+        if _CDP_MGMT_HEADER_RE.match(stripped):
+            address_section = "management"
+            continue
+        if _CDP_ADVERT_HEADER_RE.match(stripped):
+            address_section = None
+            continue
+
         ip = _CDP_IP_RE.match(line)
         if ip:
-            current.ip_addresses.append(ip.group("value"))
+            address = ip.group("value")
+            # Every advertised address is kept; the section only records which
+            # one the neighbour declared as the adjacency's own (entry) versus
+            # its management address. Neither is dropped or invented.
+            if address_section == "management":
+                if address not in current.management_addresses:
+                    current.management_addresses.append(address)
+            elif address not in current.entry_addresses:
+                current.entry_addresses.append(address)
+            if address not in current.ip_addresses:
+                current.ip_addresses.append(address)
             continue
         platform = _CDP_PLATFORM_CAP_RE.match(line.strip())
         if platform:

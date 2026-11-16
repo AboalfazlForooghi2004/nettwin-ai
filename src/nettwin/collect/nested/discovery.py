@@ -106,7 +106,13 @@ class DiscoveryEdge:
     target: str                        # normalized identity of the neighbour
     local_interface: str
     remote_interface: str
+    #: The address this adjacency was dialled through (deterministic: the
+    #: first address the neighbour advertised as its *entry* address).
     target_ip: str | None = None
+    #: Every address the neighbour advertised in this block. Two routers may
+    #: legitimately report different addresses for the same neighbour (one per
+    #: link), so both are preserved here rather than collapsed into target_ip.
+    target_ips: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -361,8 +367,19 @@ class RecursiveDiscovery:
                 child_identity = resolved or normalize_device_key(device_id)
                 if resolved:
                     self._name_index.add(resolved, device_id)
-                child_ip = self._pick_ip(detail.get("ip_addresses") or [], aliases)
-                aliases.add(child_identity, child_ip)
+                advertised = [str(ip) for ip in (detail.get("ip_addresses") or []) if ip]
+                entry_ips = [str(ip) for ip in (detail.get("entry_addresses") or []) if ip]
+                management_ips = [
+                    str(ip) for ip in (detail.get("management_addresses") or []) if ip
+                ]
+                child_ip = self._pick_ip(
+                    advertised, aliases, entry_addresses=entry_ips
+                )
+                # Every advertised address belongs to this one device: register
+                # them all so a later mention of either address resolves to the
+                # same identity (Task 3) and never creates a second node.
+                for address in [*entry_ips, *management_ips, *advertised]:
+                    aliases.add(child_identity, address)
                 result.edges.append(
                     DiscoveryEdge(
                         source=identity,
@@ -374,6 +391,7 @@ class RecursiveDiscovery:
                             str(detail.get("remote_interface") or "")
                         ),
                         target_ip=child_ip,
+                        target_ips=advertised,
                     )
                 )
                 existing = nodes.get(child_identity)
@@ -552,11 +570,28 @@ class RecursiveDiscovery:
         return observations
 
     @staticmethod
-    def _pick_ip(addresses: Sequence[str], aliases: IpAliases) -> str | None:
-        """Choose a neighbour address deterministically (first one advertised)."""
-        for address in addresses:
-            if address:
-                return address
+    def _pick_ip(
+        addresses: Sequence[str],
+        aliases: IpAliases,
+        *,
+        entry_addresses: Sequence[str] = (),
+    ) -> str | None:
+        """Choose the neighbour address to dial, deterministically.
+
+        Preference order, and never a guess:
+
+        1. the first ``Entry address(es)`` value — the address the neighbour
+           declared for this adjacency, which is the one it answers on;
+        2. otherwise the first ``Management address(es)`` value;
+        3. otherwise the first advertised address at all.
+
+        ``aliases`` is consulted only for a tie-break-free deterministic scan;
+        no address is ever synthesised from a name or a subnet.
+        """
+        for candidate in (entry_addresses, addresses):
+            for address in candidate:
+                if address:
+                    return address
         return None
 
 
