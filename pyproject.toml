@@ -32,6 +32,15 @@ dev = [
 collect = [
     "netmiko[par4]>=4.8,<5",
 ]
+# Phase 2.4: the live progress view. Optional — the CLI degrades to a plain
+# line writer when rich is absent, and CI never needs it.
+progress = [
+    "rich>=13.0",
+]
+# Everything an operator needs for a real recursive run.
+cli = [
+    "nettwin-ai[collect,progress]",
+]
 
 [project.scripts]
 nettwin = "nettwin.main:main"

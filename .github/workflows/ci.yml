@@ -1,0 +1,124 @@
+name: CI
+
+# Triggers
+# --------
+# * every push to a feature branch (pnetlab/*, feature/*, fix/*, chore/*, ...)
+# * every pull request targeting main
+# * manual dispatch, so a branch can be re-checked without a commit
+#
+# Deliberately NOT triggered on `main` pushes: main is only ever updated by a
+# reviewed merge, and that merge already ran these checks on the branch.
+on:
+  push:
+    branches:
+      - "**"
+      - "!main"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# A new push to the same branch cancels the previous run: no stale red X.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the workflow only reads the repo.
+permissions:
+  contents: read
+
+env:
+  # Keep pip honest about the interpreter, and stop pytest from writing
+  # bytecode we do not need in CI.
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  quality:
+    name: Lint, test, demo (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.12 is the floor declared in pyproject.toml (requires-python >=3.12);
+        # 3.13 is what the project is developed and validated against locally.
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          # setup-python keys its cache on this file; the extras below are
+          # folded into it via PIP_CACHE_PURGE-unrelated pip caching.
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        # [dev] brings pytest + ruff, [collect] brings netmiko (the recursive
+        # discovery tests import it), [progress] brings rich. No credentials
+        # and no network access to any lab device are needed for any of them.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,collect,progress]"
+
+      - name: Show versions
+        run: |
+          python --version
+          python -m pip --version
+          python -m ruff --version
+          python -m pytest --version
+
+      - name: Ruff
+        # Fails the job on any lint error. No --fix in CI: a clean tree here
+        # means the committed code is already clean.
+        run: python -m ruff check . --output-format=github
+
+      # ---- tests ---------------------------------------------------------- #
+      # The full suite is mocked / fixture-driven. No test opens a socket to
+      # a lab device and no test calls an external LLM, so the whole suite is
+      # safe on a GitHub-hosted runner. (The PNETLab run is an operator step:
+      # see docs/PHASE2_3_RECURSIVE_REPORT.md.)
+      - name: pytest (full suite)
+        run: python -m pytest -q
+
+      - name: Regression — CDP parser
+        # `show cdp neighbors detail` is what carries neighbour addresses;
+        # these two files pin the real-IOS capture shapes.
+        run: python -m pytest -q tests/test_cdp_management_address.py
+          tests/test_cisco_collector.py
+
+      - name: Regression — recursive discovery
+        run: python -m pytest -q tests/test_recursive_discovery.py
+          tests/test_netmiko_transport.py tests/test_progress.py
+
+      - name: Deterministic demo
+        # --no-llm: the LLM evaluation loop needs a gateway and an API key.
+        # It is intentionally excluded from required CI; the deterministic
+        # engine it validates is fully covered here.
+        run: python scripts/lab_demo.py --no-llm
+
+      - name: CLI smoke test (no live device touched)
+        # Exercises argument parsing, the allowlist print and --no-progress
+        # without connecting anywhere. --dry-run guarantees no socket opens.
+        run: |
+          python scripts/discover_recursive.py --seed 192.168.98.34 --dry-run
+          python scripts/discover_recursive.py --seed 192.168.98.34 --dry-run --no-progress
+
+      - name: Assert the suite did not silently skip everything
+        # A green run that collected zero tests is a red run wearing a costume.
+        # `-q --collect-only` prints "path: count" per file, so sum the counts
+        # rather than counting lines (which is 0 with that format).
+        run: |
+          python - <<'PY'
+          import re, subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-m", "pytest", "--collect-only", "-q"],
+              capture_output=True, text=True, check=True,
+          ).stdout
+          total = sum(int(m.group(1)) for m in re.finditer(r":\s*(\d+)\s*$", out, re.M))
+          print(f"collected: {total}")
+          assert total > 300, f"only {total} tests collected -- suite did not load"
+          PY

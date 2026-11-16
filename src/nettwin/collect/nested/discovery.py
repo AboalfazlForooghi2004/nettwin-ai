@@ -44,6 +44,7 @@ from nettwin.collect.discovery.identity import (
     canonical_interface_display,
     normalize_device_key,
 )
+from nettwin.collect.nested.progress import DiscoveryObserver, NullProgress
 from nettwin.collect.nested.prompts import failure_reason
 from nettwin.collect.nested.session import (
     IosShellSession,
@@ -184,6 +185,7 @@ class RecursiveDiscovery:
         root_factory: RootSessionFactory | None = None,
         nested_factory: Callable[..., Transport] | None = None,
         commands: Sequence[str] = DISCOVERY_COMMANDS,
+        observer: DiscoveryObserver | None = None,
     ) -> None:
         self.seed_host = seed_host
         self._username = username
@@ -200,6 +202,10 @@ class RecursiveDiscovery:
             if command not in READ_ONLY_COMMANDS:
                 raise ValueError(f"refusing non-allowlisted discovery command: {command!r}")
         self._commands = tuple(commands)
+        #: UI hooks. Purely observational: every call is a no-op by default
+        #: and nothing in the walk reads back from it, so the algorithm's
+        #: result is bit-identical with or without one.
+        self._observer: DiscoveryObserver = observer or NullProgress()
         #: identity -> open session, so children are opened from a live parent.
         self._live_sessions: dict[str, IosShellSession] = {}
         self._last_session: IosShellSession | None = None
@@ -218,15 +224,20 @@ class RecursiveDiscovery:
             [(seed_identity, 0, [self.seed_host], None)]
         )
         aliases.add(seed_identity, self.seed_host)
+        self._observer.device_discovered(seed_identity, 0, [self.seed_host])
 
         visited: set[str] = set()
         nodes: dict[str, DiscoveredNode] = {}
         attempts: dict[str, int] = {}
 
+        self._observer.discovery_started(
+            self.seed_host, self.limits.max_depth, self.limits.max_devices
+        )
         try:
             self._walk(queue, nodes, visited, attempts, aliases, result, seed_identity)
         finally:
             self.close_all()
+            self._observer.discovery_finished()
         result.nodes = list(nodes.values())
         result.topology = _assemble_topology(result)
         return result
@@ -273,6 +284,7 @@ class RecursiveDiscovery:
             self._last_session = None
             try:
                 self._visit(node, aliases, result)
+                self._observer.device_finished(node.identity, True)
             except NestedConnectError as exc:
                 node.status = _status_for_kind(exc.kind)
                 node.error = str(exc)
@@ -280,22 +292,27 @@ class RecursiveDiscovery:
                 # name the failing hop accurately.
                 hop = "connect" if node.depth == 0 else "nested ssh"
                 result.warnings.append(f"{identity}: {hop} failed ({exc.kind}): {exc}")
+                self._observer.device_finished(identity, False, f"{hop} failed ({exc.kind})")
             except SessionAuthError as exc:
                 node.status = DeviceStatus.AUTH_FAILED
                 node.error = str(exc)
                 result.warnings.append(f"{identity}: authentication failed: {exc}")
+                self._observer.device_finished(identity, False, "authentication failed")
             except SessionTimeoutError as exc:
                 node.status = DeviceStatus.TIMEOUT
                 node.error = str(exc)
                 result.warnings.append(f"{identity}: session timeout: {exc}")
+                self._observer.device_finished(identity, False, "timeout")
             except SessionError as exc:
                 node.status = DeviceStatus.UNREACHABLE
                 node.error = str(exc)
                 result.warnings.append(f"{identity}: session error: {exc}")
+                self._observer.device_finished(identity, False, "session error")
             except CollectorError as exc:
                 node.status = DeviceStatus.UNREACHABLE
                 node.error = str(exc)
                 result.warnings.append(f"{identity}: collection error: {exc}")
+                self._observer.device_finished(identity, False, "collection error")
             except Exception as exc:  # noqa: BLE001 - one bad hop must not stop the walk
                 node.status = DeviceStatus.UNREACHABLE
                 node.error = f"{type(exc).__name__}: {exc}"
@@ -477,6 +494,7 @@ class RecursiveDiscovery:
                         ),
                     )
                     self._name_index.add(child_identity, device_id, child_identity)
+                    self._observer.device_discovered(child_identity, depth + 1, nodes[child_identity].path)
                     result.warnings.append(
                         f"{device_id}: no IP in CDP detail — not visited"
                     )
@@ -488,6 +506,9 @@ class RecursiveDiscovery:
                 # differently ("R2-3.nettwin.lab" vs "R2-3") and must resolve
                 # to this node instead of creating a second one.
                 self._name_index.add(child_identity, device_id, child_identity)
+                self._observer.device_discovered(
+                    child_identity, depth + 1, [*path, child_ip]
+                )
                 queue.append((child_identity, depth + 1, [*path, child_ip], identity))
 
     @staticmethod
@@ -525,6 +546,8 @@ class RecursiveDiscovery:
         what an operator does, and it means backtracking is a single ``exit``
         rather than re-authenticating the whole chain.
         """
+        via = "connecting to seed" if node.depth == 0 else "nested ssh"
+        self._observer.device_started(node.identity, node.depth, node.path, via)
         session: IosShellSession
         if node.depth == 0:
             session = self._root_factory(node.path[-1], self._password)
@@ -549,6 +572,7 @@ class RecursiveDiscovery:
         try:
             collected: dict[str, str] = {}
             for command in self._commands:
+                self._observer.command_started(node.identity, command)
                 collected[command] = session.run_command(command)
             observations = self._observations_from(node, session, collected)
         except Exception:

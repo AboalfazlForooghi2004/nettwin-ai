@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +52,11 @@ from nettwin.collect.nested.discovery import (  # noqa: E402
 from nettwin.collect.nested.netmiko_transport import (  # noqa: E402
     netmiko_nested_transport,
     netmiko_root_session,
+)
+from nettwin.collect.nested.progress import (  # noqa: E402
+    NullProgress,
+    RichProgress,
+    SummaryTable,
 )
 from nettwin.collect.nested.session import SessionLimits  # noqa: E402
 
@@ -81,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="print the plan and exit (no connection)"
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help=(
+            "disable the live progress view (also automatic when stderr is not a "
+            "TTY, as in CI); the final summary is still printed"
+        ),
     )
     return parser
 
@@ -131,11 +145,24 @@ def main(argv: list[str] | None = None) -> int:
         nested_factory=netmiko_nested_transport,
     )
 
+    # The live view writes to stderr so stdout stays the machine-readable
+    # report, and it is skipped entirely when stderr is not a TTY (CI, pipes)
+    # unless the operator asked for it. Discovery never reads back from it.
+    progress_enabled = not args.no_progress and sys.stderr.isatty()
+    observer = RichProgress() if progress_enabled else NullProgress()
+    discovery._observer = observer  # noqa: SLF001 - the documented seam
+
+    started = time.monotonic()
+    if progress_enabled:
+        observer._begin()  # noqa: SLF001 - start the spinner before the walk
     try:
         result = discovery.run()
     except KeyboardInterrupt:
+        observer.discovery_finished()
         print("\ninterrupted", file=sys.stderr)
         return 130
+    elapsed = time.monotonic() - started
+    observer.discovery_finished()
 
     # ---- reporting ---------------------------------------------------------
     print("\ndiscovered :")
@@ -216,6 +243,19 @@ def main(argv: list[str] | None = None) -> int:
     print(f"warnings   : {len(result.warnings)}")
     for warning in result.warnings:
         print(f"  ! {warning}")
+
+    collected_count = sum(1 for n in result.nodes if n.collected)
+    print(
+        SummaryTable.render(
+            devices=len(result.topology.devices) if result.topology else 0,
+            interfaces=len(result.topology.interfaces) if result.topology else 0,
+            routes=len(result.topology.routes) if result.topology else 0,
+            warnings=len(result.warnings),
+            elapsed=elapsed,
+            collected=collected_count,
+            discovered=len(result.nodes),
+        )
+    )
 
     seed_node = next((n for n in result.nodes if n.depth == 0), None)
     if seed_node is None or not seed_node.collected:
