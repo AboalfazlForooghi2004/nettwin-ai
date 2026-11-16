@@ -738,3 +738,102 @@ def test_14_management_only_address_produces_a_dialable_edge() -> None:
     edges = [edge for edge in result.edges if "r2-3" in edge.target]
     assert edges, "no edge to R2-3 was produced"
     assert {edge.target_ip for edge in edges} == {"10.0.34.1"}
+
+
+# --------------------------------------------------------------------------- #
+# The REAL root cause of "<no-ip>": one device, two CDP spellings.
+# --------------------------------------------------------------------------- #
+
+
+def test_15_one_device_reported_under_two_spellings_is_one_node() -> None:
+    """R2-3 appears twice in the SAME response, under two names.
+
+    Real captures prove both spellings occur for one box:
+    ``show cdp neighbors`` prints ``R2-3`` while
+    ``show cdp neighbors detail`` prints ``R2-3.nettwin.lab``.
+
+    Before the fix each sighting created its own node, so one physical device
+    produced a reachable node *and* an unreachable ``<no-ip>`` duplicate --
+    which is exactly what the live run reported. Only the first sighting is
+    dialled, so an address-less block winning that race parked the device as
+    ``<no-ip>`` even though its address was in the very same output.
+    """
+    discovery = _make_discovery(
+        root_name="R2-2",
+        root_detail="seed_r2_2_two_spellings.txt",
+        nested={"10.0.32.1": ("R2-3", "r2-3_detail.txt")},
+    )
+    result = discovery.run()
+
+    r2_3_nodes = [node for node in result.nodes if "r2-3" in node.identity]
+    assert len(r2_3_nodes) == 1, (
+        f"one device became {len(r2_3_nodes)} nodes: "
+        f"{[(n.identity, n.path) for n in r2_3_nodes]}"
+    )
+    assert not any("<no-ip>" in node.path for node in result.nodes), (
+        "an <no-ip> node survived even though the address was advertised"
+    )
+    assert r2_3_nodes[0].path[-1] == "10.0.32.1"
+
+
+def test_16_address_bearing_block_wins_over_an_addressless_one() -> None:
+    """Parsing order must not decide reachability.
+
+    The same device is advertised once without an address and once with one;
+    the address-bearing block must be the sighting that gets dialled.
+    """
+    discovery = _make_discovery(
+        root_name="R2-2",
+        root_detail="seed_r2_2_two_spellings.txt",
+        nested={"10.0.32.1": ("R2-3", "r2-3_detail.txt")},
+    )
+    result = discovery.run()
+    node = next(n for n in result.nodes if "r2-3" in n.identity)
+    assert node.path == ["192.168.98.34", "10.0.32.1"], (
+        f"dialled through the wrong path: {node.path}"
+    )
+
+
+def test_17_both_parents_addresses_are_preserved_for_one_device() -> None:
+    """Q4: R2-3 seen from two parents -> ONE node, BOTH addresses kept.
+
+    R2-4 (seed) advertises R2-3 at 10.0.34.1; R2-2 (one hop away) advertises
+    it at 10.0.32.1. Both parents are collected in the same run.
+    """
+    limits = SessionLimits(connect_timeout=0.3, command_timeout=0.3, max_depth=3, max_devices=8)
+    discovery = RecursiveDiscovery(
+        seed_host="192.168.98.34",
+        username=USER,
+        password=PASS,
+        limits=limits,
+        root_factory=lambda host, pw: IosShellSession(
+            host=host,
+            transport=root_transport(
+                "R2-4",
+                "r2-4_with_r2-3_management_only.txt",
+                ssh_targets=("10.0.21.1", "10.0.34.1"),
+            ),
+            limits=limits,
+            username=USER,
+            password=pw,
+        ),
+        nested_factory=lambda *, host, username, password, parent=None: nested_transport(
+            *(
+                ("R2-2", "r2-2_with_r2-3_detail.txt")
+                if host == "10.0.21.1"
+                else ("R2-3", "r2-3_detail.txt")
+            )
+        ),
+    )
+    result = discovery.run()
+
+    r2_3_nodes = [n for n in result.nodes if "r2-3" in n.identity]
+    assert len(r2_3_nodes) == 1, [n.identity for n in r2_3_nodes]
+    assert r2_3_nodes[0].collected, r2_3_nodes[0].status
+
+    advertised: set[str] = set()
+    for edge in result.edges:
+        if "r2-3" in edge.target:
+            advertised.update(edge.target_ips)
+    assert advertised == {"10.0.32.1", "10.0.34.1"}, advertised
+    assert not any("<no-ip>" in n.path for n in result.nodes)

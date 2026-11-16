@@ -1,0 +1,27 @@
+-------------------------
+Device ID: R2-3
+Entry address(es):
+  IP address: 10.0.32.1
+Platform: Linux Uni,  Capabilities: Router
+Interface: Ethernet0/0,  Port ID (outgoing port): Ethernet0/1
+Holdtime : 148 sec
+
+Version :
+Cisco IOS Software, Linux Software (I86BI_LINUX-ADVENTERPRISEK9-M), Version 15.2(4)M5, RELEASE SOFTWARE (fc2)
+
+advertisement version: 2
+Management address(es):
+  IP address: 10.0.32.1
+
+-------------------------
+Device ID: R2-3.nettwin.lab
+Entry address(es):
+Platform: Linux Uni,  Capabilities: Router
+Interface: Ethernet0/1,  Port ID (outgoing port): Ethernet0/1
+Holdtime : 137 sec
+
+Version :
+Cisco IOS Software, Linux Software (I86BI_LINUX-ADVENTERPRISEK9-M), Version 15.2(4)M5, RELEASE SOFTWARE (fc2)
+
+advertisement version: 2
+-------------------------

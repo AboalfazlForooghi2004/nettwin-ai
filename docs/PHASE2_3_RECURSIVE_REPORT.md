@@ -6,7 +6,7 @@
 
 | Check | Result |
 |---|---|
-| `python -m pytest` | **353 passed** (274 + 41 recursive + 29 transport + 9 cdp-address) |
+| `python -m pytest` | **356 passed** (274 + 44 recursive + 29 transport + 9 cdp-address) |
 | `python -m ruff check .` | **All checks passed!** |
 | `python scripts/lab_demo.py --no-llm` | **deterministic: PASS / llm loop: PASS** |
 | Domain schema / engine / graph / simulation | **0 files changed** |
@@ -262,84 +262,113 @@ use (`auth` / `timeout` / `refused` / `hostkey` / `unreachable`) and raised as
 (`connect` vs `nested ssh`). Eight cases are parametrised in the tests against
 real netmiko exception classes.
 
-## Fourth bug: a neighbour reachable only via `Management address(es)` became `<no-ip>`
+## Fourth bug: `<no-ip>` for a device that plainly advertises an address
 
-**Live evidence.** R2-3 *does* advertise addresses, and they are visible from
-two neighbours on two different links:
+### Correction to the first analysis
 
-| seen from | section | address |
+The first write-up blamed the `Management address(es)` parsing order and called
+that the cause of the live `<no-ip>`. **That was wrong**, and the operator was
+right to challenge it: their captures show the R2-3 address in
+`Entry address(es)` *before* `Version:`, so a management-only parse defect
+cannot explain it. Checked directly against the old parser with the exact
+blocks:
+
+```
+OLD parser, r2-2_exact.txt -> R2-3 ips=['10.0.32.1']    warnings=[]
+OLD parser, r2-4_exact.txt -> R2-3 ips=['10.0.34.1']    warnings=[]
+```
+
+The parser was **not** the cause of `<no-ip>`. The real cause is below; the
+parser defect is kept as a separate, independently verified fix.
+
+### Confirmed root cause: one device, two CDP spellings, two nodes
+
+Real captures on this lab prove both spellings occur for the same box:
+
+```
+show cdp neighbors         ->  Device ID "R2-3"                (ios152 capture)
+show cdp neighbors detail  ->  Device ID "R2-3.nettwin.lab"
+```
+
+`_walk` keyed each queued child by the **raw CDP name**, so those two became
+different keys (`r2-3` vs `r2-3.nettwin.lab`). Only the *first* sighting of a
+device is dialled, and the enqueue loop then did:
+
+```python
+existing = nodes.get(child_identity)
+if existing is not None:
+    continue          # a later sighting can never improve anything
+```
+
+Two consequences, both producing exactly the reported symptom:
+
+1. **Duplicate node.** A block without a usable address won the race, creating
+   `path=[..., "<no-ip>"]`. The same device's other block *did* carry
+   `10.0.32.1` but landed on a second key, so the address never reached the
+   first node. Result: one reachable node and one `<no-ip>` node for one
+   physical router — and the `<no-ip>` one is what gets reported.
+2. **Placeholders were permanent.** Even for a single key, a node created
+   without an address was never upgraded, because `existing is not None:
+   continue` discarded every later, better sighting.
+
+Reproduced end-to-end with a seed that advertises R2-3 under both spellings,
+one block with the address and one without — on the old code:
+
+```
+identity=r2-3.nettwin.lab   unreachable   path=['192.168.98.34', '<no-ip>']   <- the reported symptom
+identity=r2-3               timeout       path=['192.168.98.34', '10.0.32.1'] <- same device, has the IP
+R2-3 node count: 2                                                            <- must be 1
+```
+
+### Fixes
+
+| # | Fix | Effect |
 |---|---|---|
-| R2-2 | `Entry address(es)` | `10.0.32.1` |
-| R2-4 | `Entry address(es)` **and** `Management address(es)` | `10.0.34.1` |
+| 1 | New child nodes are registered in the name index **at creation**, not only at the start of a parent's loop | a later block in the same response resolves to the node just created |
+| 2 | Detail blocks are ordered address-bearing-first before enqueueing | the sighting that can actually be dialled is the one that creates the node |
+| 3 | `_upgrade_placeholder` promotes an un-collected `<no-ip>` node when a later block advertises an address | placeholders are no longer permanent |
+| 4 | A collected device is re-keyed to its real hostname and any stale `<no-ip>` duplicate is merged away, both spellings registered | one device can no longer survive as two nodes |
 
-NetTwin reported `r2-3.nettwin.lab ... <no-ip>`.
+Nothing is guessed: every address used comes from the device's own output, and
+a neighbour that genuinely advertises nothing is still flagged.
 
-**Root cause — in the parser, not the network.** `parse_show_cdp_neighbors_detail`
-kept a `pending_version` flag that was set by `Version :` and cleared only by a
-block separator. A real IOS block puts the version body *before* the address
-sections:
+### Verified against the reported fixtures
 
-```
-Version :
-Cisco IOS Software, ...        <- collected
-advertisement version: 2       <- let through by a prefix check
-Management address(es):        <- swallowed by the version body
-  IP address: 10.0.34.1        <- swallowed by the version body
-```
-
-Every line after `Version :` that did not start with `advertisement` or
-`Capability codes` was appended to the version text and skipped. So the
-`Management address(es)` header and its IP were never matched. When a
-neighbour's only advertised address lived in that section, `ip_addresses` came
-back empty, the parser emitted *"advertises no IP address"*, and discovery
-created the node with `path=[..., "<no-ip>"]`, status `unreachable`, and never
-dialled it.
-
-Proven against the old code with the new fixture:
+Both parents collected in one run (`R2-4` seed sees R2-3 at `10.0.34.1`,
+`R2-2` sees it at `10.0.32.1`):
 
 ```
-OLD -> R2-3.nettwin.lab: ips=[]
-       warning: "advertises no IP address — reachable only by name"
-NEW -> R2-3.nettwin.lab: ips=['10.0.34.1']   (management_addresses=['10.0.34.1'])
+r2-3   COLLECTED   path=['192.168.98.34', '10.0.34.1']
+R2-3 node count          : 1
+r2-4 -> r2-3.nettwin.lab : dialled=10.0.34.1  all=['10.0.34.1']
+r2-2 -> r2-3.nettwin.lab : dialled=10.0.32.1  all=['10.0.32.1']
+addresses preserved      : ['10.0.32.1', '10.0.34.1']
+'<no-ip>' anywhere       : False
 ```
 
-**Fix.** The version body now ends at the next section header
-(`Entry address(es)`, `Management address(es)`, `advertisement version`,
-`Capability codes`, `Platform:`, `Interface:`, `Holdtime :`, `Version :`), and
-each `IP address:` line is recorded under the section it appeared in:
+Regression tests `test_15`, `test_16`, `test_17` fail on the old code
+(`['192.168.98.34', '<no-ip>']`) and pass now.
 
-| field | meaning |
-|---|---|
-| `ip_addresses` | every address advertised, in order, deduplicated |
-| `entry_addresses` | the subset from `Entry address(es)` — the adjacency's own |
-| `management_addresses` | the subset from `Management address(es)` |
+### Separately confirmed: the `Management address(es)` parser defect
 
-**Choosing the address to dial** (`_pick_ip`) is still deterministic and never
-invents a value: first entry address, else first management address, else the
-first advertised address. Nothing is synthesised from a hostname or a subnet.
+Independent of the above, and worth fixing on its own merits: the
+`pending_version` flag set by `Version :` was cleared only by a block separator,
+so everything after it that did not start with `advertisement`/`Capability
+codes` was appended to the version body — including `Management address(es)`
+and its IP. A neighbour advertising an address **only** there parsed to
+`ip_addresses == []`.
 
-**Two addresses, one device.** Every advertised address is registered in
-`IpAliases` against the same normalized identity, so mentioning either address
-later resolves to the same node. `DiscoveryEdge` gained `target_ips` (all
-addresses on that adjacency) while `target_ip` stays the single dialled
-address. Verified: R2-3 seen from both parents yields **one** node with
-`{'10.0.32.1', '10.0.34.1'}` recorded on its edges, and `collected` when the
-management-only path is used.
+```
+OLD -> ips=[]                    warning "advertises no IP address"
+NEW -> ips=['10.0.34.1']         management_addresses=['10.0.34.1']
+```
 
-**Fixtures and tests.** `tests/data/nested/` gained
-`r2-2_with_r2-3_detail.txt`, `r2-4_with_r2-3_management_only.txt`, and
-`r2-3_detail.txt`, built from the reported outputs. `tests/test_cdp_management_address.py`
-adds 9 tests (both sections extracted, no duplication when the address repeats,
-no leakage between blocks, version body not contaminated, a genuinely
-address-less neighbour still warns). `tests/test_recursive_discovery.py` adds
-2 discovery-level tests. `_make_discovery` gained `root_detail` so a different
-device can be the seed.
+The version body now ends at the next section header, and addresses are
+recorded per section (`entry_addresses` / `management_addresses`). This case
+was **not** what the live run hit, since the live blocks carry the address in
+`Entry address(es)`.
 
-**Safety unchanged.** The allowlist is still the same six read-only commands
-(guarded by its own test); no configuration command was added; no SSH check was
-weakened — a neighbour with no address at all is still flagged, not guessed.
-
-## Limitations
+## Limitations## Limitations
 
 1. **No live lab validation.** The acceptance criterion
    (`Ubuntu → R2-1 → R2-2 → R2-4` on real hardware) has **not** been executed.
@@ -361,7 +390,7 @@ weakened — a neighbour with no address at all is still flagged, not guessed.
 
 | Requirement | Status |
 |---|---|
-| Automated tests (79 new, 353 total) | ✅ complete |
+| Automated tests (82 new, 356 total) | ✅ complete |
 | CLI requiring only the seed | ✅ complete |
 | Duplicate prevention / cycle detection | ✅ tested |
 | Limits + explicit failure statuses | ✅ tested |
@@ -369,6 +398,7 @@ weakened — a neighbour with no address at all is still flagged, not guessed.
 | Post-login prompt re-wait / redaction (live bugs) | ✅ **fixed, mocked regression added** |
 | Auth failure reported as a timeout | ✅ **fixed, mocked regression added** |
 | Neighbour with only `Management address(es)` → `<no-ip>` | ✅ **fixed, real-output fixtures** |
+| One device under two CDP spellings → duplicate `<no-ip>` node | ✅ **confirmed cause, fixed + 3 regressions** |
 | **Live `Ubuntu → R2-1 → R2-2 → R2-4`** | ❌ **not run — operator step** |
 
 > The transport fix is verified against the **installed** netmiko/paramiko

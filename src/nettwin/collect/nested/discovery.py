@@ -337,6 +337,36 @@ class RecursiveDiscovery:
                 # now occupied by this child, so the next sibling must re-open.
                 self._live_sessions.pop(node.parent, None)
 
+            # DEFECT 1 FIX: a collected device's hostname frequently differs
+            # from the CDP Device ID it was discovered under ("R2-3" vs
+            # "R2-3.nettwin.lab"). The node is re-keyed to the real hostname
+            # above, while an earlier sighting may already sit in ``nodes``
+            # under the CDP name -- typically an unreachable "<no-ip>"
+            # placeholder. Left alone, that placeholder survives as a SECOND
+            # node for one physical device, and it is the one that gets
+            # reported. Merge it away and register both spellings.
+            self._name_index = getattr(self, "_name_index", DeviceNameIndex())
+            for stale_key, stale_node in list(nodes.items()):
+                if stale_key == identity:
+                    continue
+                # The index resolves a bare hostname to a collected FQDN (and
+                # refuses when two devices would match), so it is the authority
+                # on "is this the same box?" -- never a suffix guess.
+                resolved_stale, _ = self._name_index.resolve(stale_key)
+                same_device = (
+                    stale_node is node
+                    or normalize_device_key(stale_key) == normalize_device_key(identity)
+                    or resolved_stale == identity
+                )
+                if not same_device:
+                    continue
+                if stale_node is not node and not stale_node.collected:
+                    nodes.pop(stale_key, None)
+                    result.warnings.append(
+                        f"{stale_key!r} and {identity!r} are the same device "
+                        f"(merged, kept path {node.path})"
+                    )
+                self._name_index.add(identity, stale_key)
             nodes[identity] = node
             if not node.collected:
                 continue
@@ -351,6 +381,16 @@ class RecursiveDiscovery:
                 continue
 
             detail_rows = node.observations.cdp_neighbors_detail if node.observations else []
+            # A device can appear in more than one block (one per link, or a
+            # short vs FQDN spelling). Only the FIRST sighting creates and
+            # dials the node, so address-bearing blocks must come first --
+            # otherwise an address-less block wins and the device is parked as
+            # an unreachable "<no-ip>" even though its address was advertised
+            # in the very same response.
+            detail_rows = sorted(
+                detail_rows,
+                key=lambda row: 0 if (row.get("ip_addresses") or []) else 1,
+            )
             if not hasattr(self, "_name_index"):
                 self._name_index = DeviceNameIndex()
             for discovered in nodes.values():
@@ -395,7 +435,32 @@ class RecursiveDiscovery:
                     )
                 )
                 existing = nodes.get(child_identity)
+                if existing is None:
+                    # The same device may already be known under its other
+                    # spelling ("R2-3" vs "R2-3.nettwin.lab"). Without this,
+                    # a second node is created for one physical box -- which is
+                    # how an unreachable "<no-ip>" duplicate came to be
+                    # reported alongside a perfectly reachable node.
+                    for other_key, other_node in nodes.items():
+                        if other_key == child_identity:
+                            continue
+                        resolved_other, _ = self._name_index.resolve(other_key)
+                        if (
+                            normalize_device_key(other_key) == child_identity
+                            or resolved_other == child_identity
+                            or normalize_device_key(child_identity)
+                            == normalize_device_key(other_key.split(".")[0])
+                        ):
+                            existing = other_node
+                            child_identity = other_key
+                            break
                 if existing is not None:
+                    # DEFECT 2 FIX: never discard a better path. A node first
+                    # created without an address (or with a worse one) must be
+                    # upgraded when a later block advertises a usable address,
+                    # otherwise "<no-ip>" sticks forever even though the device
+                    # plainly advertises 10.0.x.y.
+                    self._upgrade_placeholder(existing, child_ip, path)
                     continue
                 if child_ip is None:
                     nodes[child_identity] = DiscoveredNode(
@@ -411,13 +476,42 @@ class RecursiveDiscovery:
                             "session (never guessed)"
                         ),
                     )
+                    self._name_index.add(child_identity, device_id, child_identity)
                     result.warnings.append(
                         f"{device_id}: no IP in CDP detail — not visited"
                     )
                     continue
                 if child_ip in aliases.all_ips() and node_by_ip(nodes, child_ip):
                     continue
+                # Teach the index about this brand-new node immediately: a
+                # later block in the very same response may spell the device
+                # differently ("R2-3.nettwin.lab" vs "R2-3") and must resolve
+                # to this node instead of creating a second one.
+                self._name_index.add(child_identity, device_id, child_identity)
                 queue.append((child_identity, depth + 1, [*path, child_ip], identity))
+
+    @staticmethod
+    def _upgrade_placeholder(
+        node: DiscoveredNode, child_ip: str | None, parent_path: list[str]
+    ) -> None:
+        """Give an address-less placeholder node a real, advertised address.
+
+        A neighbour can be seen twice: once by a block that carried no usable
+        address (creating ``path=[..., "<no-ip>"]``) and once by a block that
+        advertised one. Before this fix the second sighting was dropped by
+        ``if existing is not None: continue``, so the placeholder stayed
+        unreachable forever even though the address was right there.
+
+        Only nodes that have NOT been collected are upgraded, and only with an
+        address that was actually advertised -- nothing is guessed.
+        """
+        if node.collected or child_ip is None:
+            return
+        if "<no-ip>" not in node.path:
+            return
+        node.path = [*parent_path, child_ip]
+        node.status = DeviceStatus.UNREACHABLE
+        node.error = ""
 
     # -- one device --------------------------------------------------------- #
 
