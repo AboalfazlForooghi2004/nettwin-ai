@@ -38,6 +38,32 @@ import sys
 import time
 from pathlib import Path
 
+
+def _link_audit(result) -> dict:  # noqa: ANN001 - RecursiveDiscoveryResult
+    """The evidence trail behind ``topology.links`` (and behind its absence)."""
+    link_result = getattr(result, "link_result", None)
+    if link_result is None:
+        return {"confirmed": 0, "candidates": [], "rules": {}, "note": "link stage did not run"}
+    rules: dict[str, int] = {}
+    for candidate in link_result.candidates:
+        reason = str(getattr(candidate, "rule", "") or "unknown")
+        rules[reason] = rules.get(reason, 0) + 1
+    return {
+        "confirmed": len(link_result.links),
+        "candidates": [
+            {"rule": str(c.rule), "detail": c.detail}
+            for c in link_result.candidates
+            if c.link is None
+        ],
+        "rules": rules,
+        "matched_rows": link_result.matched_rows,
+        "note": (
+            "links are built only from two-sided CDP evidence; "
+            "one-sided or ambiguous rows stay candidates"
+        ),
+    }
+
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
@@ -59,6 +85,7 @@ from nettwin.collect.nested.progress import (  # noqa: E402
     SummaryTable,
 )
 from nettwin.collect.nested.session import SessionLimits  # noqa: E402
+from nettwin.render import render_html, render_svg  # noqa: E402
 
 USERNAME_ENV = "NETTWIN_DEVICE_USERNAME"
 PASSWORD_ENV = "NETTWIN_DEVICE_PASSWORD"
@@ -194,7 +221,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"\nmerged     : {len(result.topology.devices)} devices, "
               f"{len(result.topology.interfaces)} interfaces, "
+              f"{len(result.topology.links)} links, "
               f"{len(result.topology.routes)} routes -> {topology_path}")
+
+        # Visualizations are rendered from the normalized topology only, so a
+        # drawing can never show more than the collected evidence supports.
+        title = f"NetTwin discovery — {args.seed}"
+        svg_path = output_dir / "topology.svg"
+        html_path = output_dir / "topology.html"
+        try:
+            svg_path.write_text(
+                render_svg(result.topology, title=title), encoding="utf-8"
+            )
+            html_path.write_text(
+                render_html(result.topology, title=title, run_id=str(output_dir.name)),
+                encoding="utf-8",
+            )
+            print(f"visualize  : {html_path}")
+            print(f"             {svg_path}")
+        except Exception as exc:  # noqa: BLE001 - rendering must never fail discovery
+            print(f"visualize  : FAILED — {exc} (yaml/discovery output is intact)",
+                  file=sys.stderr)
     else:
         print("\nmerged     : nothing collected")
 
@@ -231,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             for e in result.edges
         ],
         "stats": {"visits": result.visits, "ssh_attempts": result.ssh_attempts},
+        "links": _link_audit(result),
         "warnings": result.warnings,
     }
     discovery_path = output_dir / "discovery.yaml"
@@ -250,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             devices=len(result.topology.devices) if result.topology else 0,
             interfaces=len(result.topology.interfaces) if result.topology else 0,
             routes=len(result.topology.routes) if result.topology else 0,
+            links=len(result.topology.links) if result.topology else 0,
             warnings=len(result.warnings),
             elapsed=elapsed,
             collected=collected_count,

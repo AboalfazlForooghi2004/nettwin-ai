@@ -1,0 +1,13 @@
+Version: FortiGate-100F v7.4.4,build2662,240514 (GA)
+Serial-Number: FG100FTK00000001
+BIOS version: 05000020
+System Part-Number: P25635-20
+Log hard disk: Available
+Hostname: FGT-A
+Operation Mode: NAT
+Current virtual domain: root
+Max number of virtual domains: 10
+Current HA mode: standalone
+Branch point: 2662
+Release Version Information: GA
+System time: Sat Nov 15 09:12:44 2026

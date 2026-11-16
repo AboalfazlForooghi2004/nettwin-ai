@@ -1,0 +1,31 @@
+== [ port1 ]
+name: port1
+mode: static
+ip: 192.168.98.60 255.255.255.0
+status: up
+type: physical
+role: lan
+
+== [ port2 ]
+name: port2
+mode: static
+ip: 10.10.10.1 255.255.255.0
+status: up
+type: physical
+role: lan
+
+== [ port3 ]
+name: port3
+mode: static
+ip: 0.0.0.0 0.0.0.0
+status: down
+type: physical
+role: undefined
+
+== [ wan1 ]
+name: wan1
+mode: dhcp
+ip: 203.0.113.25 255.255.255.248
+status: up
+type: physical
+role: wan

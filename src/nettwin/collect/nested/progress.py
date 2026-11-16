@@ -310,12 +310,14 @@ class SummaryTable:
         elapsed: float,
         collected: int,
         discovered: int,
+        links: int = 0,
     ) -> str:
         lines = [
             "",
             "================ SUMMARY ================",
             f"  devices     : {devices}",
             f"  interfaces  : {interfaces}",
+            f"  links       : {links}",
             f"  routes      : {routes}",
             f"  warnings    : {warnings}",
             f"  collected   : {collected}/{discovered} discovered",

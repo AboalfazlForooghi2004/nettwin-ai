@@ -30,6 +30,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
 
 from nettwin.collect import ios_parsers as parsers
 from nettwin.collect.cisco_ios import (
@@ -56,6 +57,9 @@ from nettwin.collect.nested.session import (
     Transport,
 )
 from nettwin.domain.models import Topology
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from nettwin.collect.discovery.links import LinkDiscoveryResult
 
 #: Commands that are safe to run on any device, in discovery order.
 #: ``DEFAULT_COMMANDS`` is the Phase-2 set; the detail command is what carries
@@ -123,6 +127,8 @@ class RecursiveDiscoveryResult:
     nodes: list[DiscoveredNode] = field(default_factory=list)
     edges: list[DiscoveryEdge] = field(default_factory=list)
     topology: Topology | None = None
+    #: Phase 2.5: the audit trail behind ``topology.links``.
+    link_result: LinkDiscoveryResult | None = None
     warnings: list[str] = field(default_factory=list)
     visits: int = 0
     ssh_attempts: int = 0
@@ -239,7 +245,8 @@ class RecursiveDiscovery:
             self.close_all()
             self._observer.discovery_finished()
         result.nodes = list(nodes.values())
-        result.topology = _assemble_topology(result)
+        result.topology, link_warnings = _assemble_topology(result)
+        result.warnings.extend(link_warnings)
         return result
 
     def _walk(self, queue, nodes, visited, attempts, aliases, result, seed_identity):
@@ -755,8 +762,21 @@ def node_by_ip(nodes: dict[str, DiscoveredNode], ip: str) -> DiscoveredNode | No
     return None
 
 
-def _assemble_topology(result: RecursiveDiscoveryResult) -> Topology | None:
-    """Merge every collected device topology into one, links left to Phase 2.2."""
+def _assemble_topology(
+    result: RecursiveDiscoveryResult,
+) -> tuple[Topology | None, list[str]]:
+    """Merge every collected device topology, then normalize links.
+
+    Phase 2.5 wires in the link stage the recursive path previously skipped:
+    ``discover_links`` is the same strict, two-sided matcher the non-recursive
+    pipeline already used, so no new link logic is introduced here. Links are
+    built **only** from CDP evidence collected on both sides; every row that
+    does not satisfy the four-way agreement is reported, never bumped into a
+    link.
+
+    Returns the merged topology and the warnings to surface on the run report.
+    """
+    from nettwin.collect.discovery.links import collect_evidence, discover_links
     from nettwin.collect.discovery.merge import (
         DeviceCollection,
         merge_device_topologies,
@@ -773,9 +793,53 @@ def _assemble_topology(result: RecursiveDiscoveryResult) -> Topology | None:
         if node.topology is not None
     ]
     if not collections:
-        return None
+        return None, []
     merge = merge_device_topologies(collections)
-    return merge.topology
+    topology = merge.topology
+    warnings: list[str] = [f"merge: {w}" for w in merge.warnings]
+
+    # --- Link normalization ------------------------------------------------
+    rows_by_device: dict[str, list[dict]] = {}
+    for collection in collections:
+        device_id = collection.device_id
+        observations = collection.observations
+        if device_id and observations is not None:
+            rows = list(observations.cdp_neighbors)
+            # ``show cdp neighbors detail`` is the only place a neighbour's
+            # management address appears; rows carrying it are preferred as
+            # evidence but only the summary rows carry both interface names.
+            if rows:
+                rows_by_device[device_id] = rows
+    evidence = collect_evidence(rows_by_device)
+    link_result = discover_links(topology, evidence)
+
+    result.link_result = link_result
+    warnings.extend(f"links: {w}" for w in link_result.warnings)
+
+    built = len(link_result.links)
+    total_rows = sum(len(rows) for rows in rows_by_device.values())
+    if total_rows == 0:
+        warnings.append(
+            "links: no CDP neighbour rows were collected on any device — "
+            "no link can be confirmed (none invented)"
+        )
+    else:
+        warnings.append(
+            f"links: {built} link(s) confirmed from two-sided CDP evidence; "
+            f"{len(link_result.candidates)} one-sided row(s) did not confirm"
+        )
+
+    connected = Topology(
+        devices=topology.devices,
+        interfaces=topology.interfaces,
+        links=link_result.links,
+        vrfs=topology.vrfs,
+        routes=topology.routes,
+        endpoints=topology.endpoints,
+        services=topology.services,
+    )
+    return connected, warnings
+
 
 
 def failure_summary(text: str) -> str:

@@ -1,0 +1,8 @@
+Codes: K - kernel, C - connected, S - static, R - RIP, B - BGP
+       O - OSPF, IA - OSPF inter area
+       * - candidate default
+
+Routing table for VRF=0
+C       10.0.0.0/16 is directly connected, internal
+C       172.16.1.0/24 is directly connected, port1
+S       192.168.50.0/24 [10/0] via 172.16.1.254, port1

@@ -1,0 +1,4 @@
+Huawei Versatile Routing Platform Software
+VRP (R) software, Version 8.180 (CE6865 V200R019C10SPC800)
+Copyright (C) 2012-2020 Huawei Technologies Co., Ltd.
+HUAWEI CE6865-48S8CQ-EI uptime is 128 days, 4 hours, 12 minutes

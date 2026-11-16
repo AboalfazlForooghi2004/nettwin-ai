@@ -1,0 +1,17 @@
+== [ port1 ]
+name: port1
+status: enable
+ip: 172.16.1.1 255.255.255.0
+speed: auto
+
+== [ port2 ]
+name: port2
+status: disable
+ip: 0.0.0.0 0.0.0.0
+speed: auto
+
+== [ internal ]
+name: internal
+status: enable
+ip: 10.0.0.1 255.255.0.0
+speed: auto

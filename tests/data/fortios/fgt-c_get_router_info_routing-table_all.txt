@@ -1,0 +1,10 @@
+Codes: K - kernel, C - connected, S - static, R - RIP, B - BGP
+       * - candidate default
+
+Routing table for VRF=0
+S*      0.0.0.0/0 [1/0] via 172.31.0.1, MPLS [1/0] via 192.168.2.1, port1
+S       192.168.20.0/24 [10/0] via 172.31.0.2, toKVM-MPLS
+      [10/0] via 10.10.10.11, internal
+C       192.168.2.0/24 is directly connected, port1
+Routing table for VRF=10
+C       172.16.101.0/24 is directly connected, VLAN101

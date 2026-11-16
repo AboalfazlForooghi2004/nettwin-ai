@@ -1,0 +1,5 @@
+Version: FortiGate-60E v6.0.14,build0527,210105 (GA)
+Serial-Number: FG60E4QK19000042
+Hostname: FGT-LEGACY
+Operation Mode: NAT
+Current virtual domain: root
