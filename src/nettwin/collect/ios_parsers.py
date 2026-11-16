@@ -591,3 +591,127 @@ def _parse_cdp_row_fallback(line: str) -> CdpNeighbor | None:
         platform=platform,
         port_id=normalize_interface(match.group("port")),
     )
+
+
+# --------------------------------------------------------------------------- #
+# show cdp neighbors detail  (Phase 2.3 — recursive discovery)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class CdpNeighborDetail:
+    """One ``show cdp neighbors detail`` block.
+
+    Unlike the summary table, the detail output carries the neighbour's
+    management IP — the value Phase 2.3 needs to open a nested SSH session.
+    A neighbour may advertise several entry addresses; ``ip_addresses``
+    preserves every one of them (never collapsed to one).
+    """
+
+    device_id: str
+    ip_addresses: list[str] = field(default_factory=list)
+    platform: str = ""
+    capabilities: str = ""
+    local_interface: str = ""   # normalized
+    remote_interface: str = ""  # normalized
+    holdtime: str = ""
+    software_version: str = ""
+
+
+_CDP_DETAIL_START_RE = re.compile(r"^-{5,}\s*$")
+_CDP_DEVICE_ID_RE = re.compile(r"^Device ID:\s*(?P<value>.+?)\s*$")
+_CDP_IP_RE = re.compile(r"^\s+IP address:\s*(?P<value>\d+\.\d+\.\d+\.\d+)\s*$")
+_CDP_PLATFORM_CAP_RE = re.compile(
+    r"^Platform:\s*(?P<platform>.*?),\s*Capabilities:\s*(?P<cap>.*?)\s*$"
+)
+_CDP_INTERFACE_RE = re.compile(
+    r"^Interface:\s*(?P<local>[^,]+),\s*Port ID \(outgoing port\):\s*(?P<port>[^,]+?)\s*$"
+)
+_CDP_HOLDTIME_RE = re.compile(r"^Holdtime\s*:\s*(?P<value>\d+)\s*sec")
+_CDP_VERSION_RE = re.compile(r"Version\s*:\s*$")
+
+
+def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail], list[str]]:
+    """Parse ``show cdp neighbors detail`` into one record per neighbour block.
+
+    Blocks are separated by a line of dashes; a block without a ``Device ID``
+    is skipped with a warning rather than guessed at.
+    """
+    records: list[CdpNeighborDetail] = []
+    warnings: list[str] = []
+
+    current: CdpNeighborDetail | None = None
+    pending_version = False
+    version_lines: list[str] = []
+
+    def flush() -> None:
+        nonlocal current, pending_version, version_lines
+        if current is None:
+            return
+        if pending_version and version_lines:
+            current.software_version = version_lines[0].strip()
+        if not current.device_id:
+            warnings.append(
+                "show cdp neighbors detail: block without Device ID skipped"
+            )
+        elif not current.ip_addresses:
+            warnings.append(
+                f"show cdp neighbors detail: {current.device_id!r} advertises no "
+                "IP address — reachable only by name"
+            )
+            records.append(current)
+        else:
+            records.append(current)
+        current = None
+        pending_version = False
+        version_lines = []
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if _CDP_DETAIL_START_RE.match(line.strip()):
+            flush()
+            continue
+        if not line.strip():
+            continue
+
+        if pending_version:
+            stripped = line.strip()
+            if stripped and not stripped.startswith(("advertisement", "Capability codes")):
+                version_lines.append(stripped)
+                continue
+
+        device_id = _CDP_DEVICE_ID_RE.match(line.strip())
+        if device_id:
+            flush()
+            current = CdpNeighborDetail(device_id=device_id.group("value").strip())
+            continue
+        if current is None:
+            continue
+
+        ip = _CDP_IP_RE.match(line)
+        if ip:
+            current.ip_addresses.append(ip.group("value"))
+            continue
+        platform = _CDP_PLATFORM_CAP_RE.match(line.strip())
+        if platform:
+            current.platform = platform.group("platform").strip()
+            current.capabilities = platform.group("cap").strip()
+            continue
+        interface = _CDP_INTERFACE_RE.match(line.strip())
+        if interface:
+            current.local_interface = normalize_interface(interface.group("local"))
+            current.remote_interface = normalize_interface(interface.group("port"))
+            continue
+        holdtime = _CDP_HOLDTIME_RE.match(line.strip())
+        if holdtime:
+            current.holdtime = holdtime.group("value")
+            continue
+        if _CDP_VERSION_RE.search(line.strip()):
+            pending_version = True
+            continue
+
+    flush()
+
+    if not records and text.strip():
+        warnings.append("show cdp neighbors detail: no neighbour blocks parsed")
+    return records, warnings

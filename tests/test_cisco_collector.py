@@ -48,6 +48,7 @@ def full_outputs() -> dict[str, str]:
         "show ip route": _read("show_ip_route.txt"),
         "show ip ospf neighbor": _read("show_ip_ospf_neighbor.txt"),
         "show cdp neighbors": _read("show_cdp_neighbors.txt"),
+        "show cdp neighbors detail": _read("show_cdp_neighbors_detail.txt"),
     }
 
 
@@ -110,7 +111,20 @@ def _collector(outputs: dict[str, str], **kwargs) -> tuple[CiscoIOSCollector, Mo
 # 1. Allowlist — reject BEFORE connecting; config mode can never be invoked
 # =========================================================================== #
 
-def test_readonly_allowlist_is_the_exact_five_commands() -> None:
+#: The Phase-2 five. Phase 2.3 appended exactly one read-only command; this
+#: constant makes that growth auditable instead of silent.
+PHASE2_ALLOWLIST = frozenset(
+    {
+        "show version",
+        "show ip interface brief",
+        "show ip route",
+        "show ip ospf neighbor",
+        "show cdp neighbors",
+    }
+)
+
+
+def test_readonly_allowlist_is_exactly_six_show_commands() -> None:
     assert READ_ONLY_COMMANDS == frozenset(
         {
             "show version",
@@ -118,9 +132,23 @@ def test_readonly_allowlist_is_the_exact_five_commands() -> None:
             "show ip route",
             "show ip ospf neighbor",
             "show cdp neighbors",
+            # Phase 2.3 — the only source of a neighbour's management IP.
+            "show cdp neighbors detail",
         }
     )
     assert set(DEFAULT_COMMANDS) == set(READ_ONLY_COMMANDS)
+
+
+def test_allowlist_grew_only_by_readonly_show_commands() -> None:
+    """Adding a command must never introduce anything that changes state."""
+    added = READ_ONLY_COMMANDS - PHASE2_ALLOWLIST
+    assert added == {"show cdp neighbors detail"}, added
+    for command in READ_ONLY_COMMANDS:
+        assert command.startswith("show "), f"non-'show' command in allowlist: {command!r}"
+    for command in added:
+        for fragment in ("configure", "conf t", "write", "copy", "reload",
+                         "clear", "erase", "debug", "enable", "no "):
+            assert fragment not in command, f"{fragment!r} in {command!r}"
 
 
 @pytest.mark.parametrize(
@@ -181,7 +209,7 @@ def test_session_disconnected_after_successful_collection(full_outputs: dict[str
     observations = collector.collect()
     assert session.disconnected is True
     assert observations.status == "ok"
-    assert len(observations.commands) == 5
+    assert len(observations.commands) == len(DEFAULT_COMMANDS) == 6
     assert all(c.status == "ok" for c in observations.commands)
 
 
@@ -580,6 +608,7 @@ def live_outputs() -> dict[str, str]:
         "show ip route": _live("show_ip_route.txt"),
         "show ip ospf neighbor": _live("show_ip_ospf_neighbor.txt"),
         "show cdp neighbors": _live("show_cdp_neighbors.txt"),
+        "show cdp neighbors detail": _live("show_cdp_neighbors_detail.txt"),
     }
 
 
@@ -819,4 +848,5 @@ def live_outputs_from_files() -> dict[str, str]:
         "show ip route": _live("show_ip_route.txt"),
         "show ip ospf neighbor": _live("show_ip_ospf_neighbor.txt"),
         "show cdp neighbors": _live("show_cdp_neighbors.txt"),
+        "show cdp neighbors detail": _live("show_cdp_neighbors_detail.txt"),
     }

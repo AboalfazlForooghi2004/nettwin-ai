@@ -51,16 +51,23 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         "show ip route",
         "show ip ospf neighbor",
         "show cdp neighbors",
+        # Phase 2.3: the only source of a neighbour's management IP, which
+        # recursive discovery needs to open the nested SSH session. Read-only,
+        # like every other entry — no configuration, no state change.
+        "show cdp neighbors detail",
     }
 )
 
 #: Deterministic default execution order.
+#: The Phase-2 order is preserved verbatim; ``show cdp neighbors detail`` is
+#: appended so existing callers see the same first five commands.
 DEFAULT_COMMANDS: tuple[str, ...] = (
     "show version",
     "show ip interface brief",
     "show ip route",
     "show ip ospf neighbor",
     "show cdp neighbors",
+    "show cdp neighbors detail",
 )
 
 # Second hard layer: fragments that must never appear in any dispatched
@@ -238,6 +245,9 @@ class DeviceObservations:
     routes: list[dict[str, Any]] = field(default_factory=list)
     ospf_neighbors: list[dict[str, Any]] = field(default_factory=list)
     cdp_neighbors: list[dict[str, Any]] = field(default_factory=list)
+    #: Phase 2.3: ``show cdp neighbors detail`` blocks — the only place a
+    #: neighbour's management IP appears. Empty for a Phase-2 style run.
+    cdp_neighbors_detail: list[dict[str, Any]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -426,6 +436,10 @@ class CiscoIOSCollector:
         cdp = run("show cdp neighbors", parsers.parse_show_cdp_neighbors)
         if cdp is not None:
             observations.cdp_neighbors = [asdict(item) for item in cdp]
+
+        cdp_detail = run("show cdp neighbors detail", parsers.parse_show_cdp_neighbors_detail)
+        if cdp_detail is not None:
+            observations.cdp_neighbors_detail = [asdict(item) for item in cdp_detail]
 
     @staticmethod
     def _overall_status(observations: DeviceObservations) -> str:
