@@ -18,14 +18,24 @@ failure so it can never come back silently.
 
 from __future__ import annotations
 
+import time
+from unittest.mock import patch
+
 import pytest
 
+import nettwin.collect.nested.netmiko_transport as module
 from nettwin.collect.nested.netmiko_transport import (
     ForwardedTransport,
     NetmikoChannelTransport,
     netmiko_nested_transport,
 )
-from nettwin.collect.nested.session import IosShellSession, SessionError, SessionLimits
+from nettwin.collect.nested.session import (
+    IosShellSession,
+    SessionError,
+    SessionLimits,
+    _sanitize,
+    _session_error,
+)
 
 FAST = SessionLimits(connect_timeout=0.3, command_timeout=0.3, poll_interval=0.001)
 PASS = "unit-test-fake-pw"
@@ -296,8 +306,6 @@ def test_connect_failure_is_reported_and_password_redacted() -> None:
         def ConnectHandler(**kwargs):  # noqa: N802 - mirrors the real name
             raise Boom(f"auth failed for {kwargs['password']} on {kwargs['host']}")
 
-    from unittest.mock import patch
-
     # The factory imports ConnectHandler from netmiko inside the function, so
     # the patch target is netmiko's own attribute.
     with patch("netmiko.ConnectHandler", FakeNetmiko.ConnectHandler):
@@ -329,3 +337,116 @@ def test_nested_transport_shares_the_parent_channel() -> None:
 def test_nested_transport_requires_a_parent() -> None:
     with pytest.raises(ValueError, match="requires the parent session"):
         netmiko_nested_transport()
+
+
+# --------------------------------------------------------------------------- #
+# Regression: the second live failure. ConnectHandler() leaves the device AT
+# its prompt, so the session must not wait for an initial prompt again.
+# --------------------------------------------------------------------------- #
+
+
+class _DeviceSittingAtItsPrompt:
+    """A device that has already printed its prompt and is now idle.
+
+    This is the state ``ConnectHandler`` hands back after
+    ``session_preparation()``. Nothing is readable until we write something,
+    which is exactly why the old code burned the whole connect_timeout.
+    """
+
+    def __init__(self, prompt: str = "R2-1#") -> None:
+        self.prompt = prompt
+        self._buffer = b""
+
+    def settimeout(self, timeout: float) -> None:  # noqa: ARG002 - signature match
+        return None
+
+    def recv(self, nbytes: int) -> bytes:  # noqa: ARG002
+        out, self._buffer = self._buffer, b""
+        return out
+
+    def sendall(self, data: bytes) -> None:
+        command = data.strip().decode()
+        text = f"\r\n{command}\r\ninterface output\r\n{self.prompt}".encode()
+        self._buffer += text
+
+
+class _ConnectionDirectlyAfterConnectHandler:
+    """The shape netmiko really returns: logged in, at prompt, paging disabled."""
+
+    def __init__(self) -> None:
+        self.remote_conn = _DeviceSittingAtItsPrompt()
+        self.base_prompt = "R2-1"
+
+    def check_enable_mode(self, check_string: str = "") -> bool:  # noqa: ARG002
+        return True
+
+    def read_channel(self) -> str:
+        return ""
+
+    def write_channel(self, data: str) -> None:  # noqa: ARG002
+        return None
+
+    def disconnect(self) -> None:
+        return None
+
+
+def test_root_session_does_not_wait_for_a_prompt_netmiko_already_found() -> None:
+    """Regression: a successful login used to die with "timeout waiting".
+
+    ``ConnectHandler`` authenticates and leaves the device at its prompt. If
+    the session then waits for an initial prompt, the socket stays idle for the
+    full connect_timeout and the run fails *after* a successful SSH login with
+    a message that blames the connection.
+    """
+    limits = SessionLimits(connect_timeout=1.0, command_timeout=1.0, poll_interval=0.01)
+    with patch("netmiko.ConnectHandler", lambda **kwargs: _ConnectionDirectlyAfterConnectHandler()):
+        started = time.monotonic()
+        session = module.netmiko_root_session("192.168.98.34", PASS, username="u", limits=limits)
+        # Must not block for the connect timeout on an idle-but-ready device.
+        assert time.monotonic() - started < 0.5
+
+        assert session.hostname == "R2-1", "netmiko's base_prompt must seed identity"
+        assert session.privilege == 15, "privilege must reflect what netmiko found"
+
+        # The first discovery command is what the live run never reached.
+        output = session.run_command("show cdp neighbors detail")
+    assert "interface output" in output
+
+
+def test_root_session_marks_itself_open_so_open_is_cheap() -> None:
+    with patch("netmiko.ConnectHandler", lambda **kwargs: _ConnectionDirectlyAfterConnectHandler()):
+        session = module.netmiko_root_session("192.168.98.34", PASS, username="u", limits=FAST)
+        prompt = session.open()
+    assert prompt.is_ready
+
+
+# --------------------------------------------------------------------------- #
+# Regression: redaction must never destroy the diagnosis it is attached to.
+# --------------------------------------------------------------------------- #
+
+
+def test_short_password_does_not_shred_our_own_error_wording() -> None:
+    """A one-character password used to mangle every message it touched.
+
+    ``password="p"`` turned "timeout waiting for prompt" into
+    "time***out waiting for ***rom***t": the operator loses the failure text at
+    exactly the moment they need it. Only untrusted text is sanitised.
+    """
+    message = _session_error(
+        "192.168.98.34: timeout waiting for initial prompt", "''", "p"
+    )
+    assert "timeout waiting for initial prompt" in message
+    assert "192.168.98.34" in message
+
+
+def test_real_secret_in_untrusted_text_is_still_removed() -> None:
+    assert _sanitize("auth failed for nettwin-ro", "nettwin-ro") == "auth failed for ***"
+
+
+def test_session_error_omits_an_empty_detail() -> None:
+    assert _session_error("192.168.98.34 -> 10.0.21.1", "", "pw") == "192.168.98.34 -> 10.0.21.1"
+
+
+def test_session_error_labels_the_untrusted_part() -> None:
+    message = _session_error("host: timeout", "R2-2#", "secret", label="last output")
+    assert message == "host: timeout (last output: R2-2#)"

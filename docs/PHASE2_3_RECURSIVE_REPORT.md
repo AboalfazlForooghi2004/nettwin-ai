@@ -6,7 +6,7 @@
 
 | Check | Result |
 |---|---|
-| `python -m pytest` | **331 passed** (274 + 39 recursive + 18 transport) |
+| `python -m pytest` | **337 passed** (274 + 39 recursive + 24 transport) |
 | `python -m ruff check .` | **All checks passed!** |
 | `python scripts/lab_demo.py --no-llm` | **deterministic: PASS / llm loop: PASS** |
 | Domain schema / engine / graph / simulation | **0 files changed** |
@@ -185,7 +185,7 @@ timeout itself, `"api"` relies on netmiko's non-blocking buffered reads, and
 in both cases `SessionLimits.connect_timeout` still bounds `ConnectHandler`
 and `command_timeout` still bounds per-command polling.
 
-**Regression coverage.** `tests/test_netmiko_transport.py` (18 tests) covers
+**Regression coverage.** `tests/test_netmiko_transport.py` (24 tests) covers
 the raw backend, the api backend, `remote_conn=None`, a wrapper that lacks
 `settimeout`, credentials redaction, and an end-to-end session that must reach
 `show cdp neighbors detail` output. One test asserts the original mistake
@@ -194,6 +194,55 @@ stays caught:
 ```python
 assert not hasattr(BaseConnection, "channel")
 ```
+
+Note that this assertion is necessary but not sufficient: `BaseConnection`
+assigns `self.channel` **per instance** in `__init__` (as a
+`netmiko.channel.SSHChannel`, a wrapper with no `settimeout`), which is how the
+attribute existed at runtime while being absent from the class. That is why the
+transport probes the *object* rather than trusting a `hasattr` on the type.
+
+## Second live bug: the run would die *after* a successful login
+
+Fixing `settimeout` exposed the next failure in the same code path, so it is
+fixed here rather than shipped and discovered on the next operator run.
+
+### `netmiko_root_session` re-waited for a prompt that had already appeared
+
+`ConnectHandler()` does not return a bare socket. It runs
+`session_preparation()` — login, `set_base_prompt()`, `set_terminal_width()`,
+`disable_paging()` — and hands back a device **already sitting at its prompt**,
+with nothing left to read. `netmiko_root_session` then built an
+`IosShellSession` with `_already_open=False`, so `open()` waited for an initial
+prompt that would never be printed again. The socket stayed idle for the full
+`connect_timeout` and raised `timeout waiting for initial prompt` — blaming the
+connection *after* the SSH login had already succeeded.
+
+Measured on a simulated post-`ConnectHandler` device (`connect_timeout=1.5`):
+
+| | result |
+|---|---|
+| before | `SessionTimeoutError` after **1.51 s**, no command ever sent |
+| after | session ready in **< 0.01 s**, `show cdp neighbors detail` returns output |
+
+The root factory now seeds identity from `connection.base_prompt`, records the
+real privilege via `check_enable_mode()`, and marks the session as already open.
+
+### Redaction was destroying the error text it was attached to
+
+`_sanitize` did a bare `str.replace(secret, "***")`. Passwords are short and
+full of common letters, so:
+
+```
+password="p"  ->  "timeout waiting for prompt"  ->  "time***out waiting for ***rom***t"
+password="o"  ->  "cannot connect to host"      ->  "cann***t c***nnect t*** h***st"
+```
+
+The operator lost the diagnosis at exactly the moment they needed it. Substring
+redaction is kept (a partial redaction is a leak), but it is now applied **only
+to untrusted text** — device output and library exception messages. Our own
+diagnostic wording is composed afterwards by `_session_error()`, so it can never
+be shredded. `_sanitize` also has exactly one implementation, shared by the
+session and the transport.
 
 ## Limitations
 
@@ -217,11 +266,12 @@ assert not hasattr(BaseConnection, "channel")
 
 | Requirement | Status |
 |---|---|
-| Automated tests (57 new, 331 total) | ✅ complete |
+| Automated tests (63 new, 337 total) | ✅ complete |
 | CLI requiring only the seed | ✅ complete |
 | Duplicate prevention / cycle detection | ✅ tested |
 | Limits + explicit failure statuses | ✅ tested |
 | Transport `settimeout` crash (live bug) | ✅ **fixed, mocked regression added** |
+| Post-login prompt re-wait / redaction (live bugs) | ✅ **fixed, mocked regression added** |
 | **Live `Ubuntu → R2-1 → R2-2 → R2-4`** | ❌ **not run — operator step** |
 
 > The transport fix is verified against the **installed** netmiko/paramiko

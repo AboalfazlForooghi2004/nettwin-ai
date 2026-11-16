@@ -100,8 +100,32 @@ TransportFactory = Callable[..., Transport]
 _HOST_PROMPT_RE = re.compile(r"^(?P<host>[A-Za-z0-9_.\-]+)\s*[>#]\s*$")
 
 
-def _sanitize(message: str, secret: str) -> str:
-    return message.replace(secret, "***") if secret else message
+def _sanitize(text: str, secret: str) -> str:
+    """Replace every occurrence of ``secret`` in *untrusted* text.
+
+    Substring replacement is deliberately aggressive: a partial redaction is a
+    leak. The cost is that a short password eats common letters
+    (``secret="p"`` turns "prompt" into "***rom***t"), so this must only ever
+    be applied to text that came from the device or from a library exception —
+    never to the diagnostic sentence we build around it. Our own wording is
+    composed after sanitising, in :func:`_session_error`.
+    """
+    return text.replace(secret, "***") if secret else text
+
+
+def _session_error(prefix: str, detail: str, secret: str, *, label: str | None = None) -> str:
+    """Join our own ``prefix`` to untrusted ``detail``, sanitising the detail.
+
+    ``label`` names the detail in the rendered message (for example
+    ``"last output"``). Only ``detail`` passes through :func:`_sanitize`, so a
+    short password can never mangle the operator-facing sentence.
+    """
+    safe_detail = _sanitize(detail, secret).strip()
+    if not safe_detail:
+        return prefix
+    if label:
+        return f"{prefix} ({label}: {safe_detail})"
+    return f"{prefix}: {safe_detail}"
 
 
 class IosShellSession:
@@ -265,13 +289,13 @@ class IosShellSession:
         reported = failure_reason(self.last_buffer)
         if reported is not None:
             raise NestedConnectError(
-                _sanitize(f"{self.host} -> {neighbour_ip}: {reported}", password),
+                _session_error(f"{self.host} -> {neighbour_ip}", reported, password),
                 _classify_nested_failure(reported),
             )
         if prompt.kind is PromptKind.ERROR or not prompt.is_ready:
             reason = failure_reason(prompt.raw) or prompt.raw or "unexpected prompt"
             raise NestedConnectError(
-                _sanitize(f"{self.host} -> {neighbour_ip}: {reason}", password),
+                _session_error(f"{self.host} -> {neighbour_ip}", reason, password),
                 _classify_nested_failure(reason),
             )
 
@@ -317,10 +341,12 @@ class IosShellSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionTimeoutError(
-                    _sanitize(
+                    _session_error(
                         f"{self.host} -> nested: timeout waiting for {context} after "
-                        f"{self._limits.connect_timeout}s (last output: {buffer[-120:]!r})",
+                        f"{self._limits.connect_timeout}s",
+                        f"{buffer[-120:]!r}",
                         self._password,
+                        label="last output",
                     )
                 )
             chunk = transport.read(min(remaining, 1.0))
@@ -347,10 +373,11 @@ class IosShellSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionTimeoutError(
-                    _sanitize(
-                        f"{self.host}: timeout waiting for {context} after {timeout}s "
-                        f"(last output: {buffer[-120:]!r})",
+                    _session_error(
+                        f"{self.host}: timeout waiting for {context} after {timeout}s",
+                        f"{buffer[-120:]!r}",
                         self._password,
+                        label="last output",
                     )
                 )
             chunk = self._transport.read(min(remaining, 1.0))

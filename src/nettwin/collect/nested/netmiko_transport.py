@@ -41,6 +41,7 @@ from nettwin.collect.nested.session import (
     SessionError,
     SessionLimits,
     SessionTimeoutError,
+    _sanitize,
 )
 
 
@@ -54,8 +55,9 @@ class _ChannelLike(Protocol):
     def settimeout(self, timeout: float) -> None: ...
 
 
-def _redact(message: str, secret: str) -> str:
-    return message.replace(secret, "***") if secret else message
+#: Secret redaction has exactly one implementation; the transport never rolls
+#: its own. Applied only to untrusted text (library exception messages).
+_redact = _sanitize
 
 
 class NetmikoChannelTransport:
@@ -128,9 +130,8 @@ class NetmikoChannelTransport:
             channel.settimeout(min(timeout, self._read_timeout))
         except Exception as exc:  # noqa: BLE001 - surface a clear, sanitized error
             self._closed = True
-            raise SessionTimeoutError(
-                _redact(f"cannot set channel timeout: {type(exc).__name__}: {exc}", self._password)
-            ) from None
+            detail = _redact(f"{type(exc).__name__}: {exc}", self._password)
+            raise SessionTimeoutError(f"cannot set channel timeout: {detail}") from None
         try:
             data = channel.recv(65535)
         except TimeoutError:
@@ -245,6 +246,14 @@ def netmiko_root_session(
         raise SessionTimeoutError(f"connect to {host} failed: {message}") from None
 
     transport = NetmikoChannelTransport(connection, password=password)
+    # ConnectHandler() runs session_preparation(): it authenticates, finds the
+    # base prompt, sets the terminal width and disables paging. It hands back a
+    # device already sitting AT its prompt, with nothing left to read. The
+    # session must therefore not wait for an initial prompt a second time —
+    # otherwise the socket stays idle for the full connect_timeout and the run
+    # dies with a misleading "timeout waiting for initial prompt" *after* a
+    # successful SSH login.
+    base_prompt = getattr(connection, "base_prompt", "") or ""
     session = IosShellSession(
         host=host,
         transport=transport,
@@ -252,6 +261,15 @@ def netmiko_root_session(
         username=username,
         password=password,
     )
+    if base_prompt:
+        session.hostname = base_prompt
+    # netmiko leaves the device in enable mode when it authenticated straight
+    # into privilege exec; record what it actually found rather than guessing.
+    try:
+        session.privilege = 15 if connection.check_enable_mode() else 0
+    except Exception:  # noqa: BLE001 - probing privilege must never break the run
+        session.privilege = 0
+    session._already_open = True  # noqa: SLF001 - documented pairing with open()
     # Keep the connection referenced so the SSH channel is not garbage
     # collected while the session is in use.
     session._netmiko_connection = connection  # noqa: SLF001 - documented pairing
