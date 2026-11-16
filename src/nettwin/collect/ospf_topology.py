@@ -103,6 +103,197 @@ def _lsa_ref(lsa: OspfRouterLsa | OspfNetworkLsa, lsa_type: int) -> OspfLsaRef:
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Canonical LSDB
+# --------------------------------------------------------------------------- #
+#
+# An OSPF area is flooded, so every router in it holds every LSA. Five collected
+# routers therefore hand us five *copies* of each of the five Router LSAs and
+# five copies of each Network LSA — 25 records for 5 real LSAs. Treating a
+# record as an LSA multiplies the topology by the number of observers.
+#
+# The fix is a canonicalisation layer: an LSA's *identity* is
+# ``(area, ls_type, link_state_id, advertising_router)`` — exactly the OSPF LSA
+# identity — and the devices that reported it are a separate axis of the model,
+# kept in ``observed_by``. Nothing is thrown away; the copies collapse, the
+# provenance does not.
+
+
+@dataclass(frozen=True)
+class LsaIdentity:
+    """The identity of an LSA within its area (its "name" in the LSDB)."""
+
+    area: str
+    lsa_type: int
+    link_state_id: str
+    advertising_router: str
+
+    def describe(self) -> str:
+        return (
+            f"Type {self.lsa_type} LSID {self.link_state_id} "
+            f"adv {self.advertising_router} area {self.area}"
+        )
+
+
+def _sequence_value(sequence: str) -> int | None:
+    """``0x80000005`` -> 2147483669, so instances can be ordered as RFC 2328 says."""
+    text = (sequence or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text, 16) if text.lower().startswith("0x") else int(text, 16)
+    except ValueError:
+        return None
+
+
+def _age_value(age: int | None) -> int:
+    """Age used only as a tie-break: a lower age means a fresher copy."""
+    return age if isinstance(age, int) else 10**9
+
+
+def canonical_router_lsas(
+    devices: list[OspfDeviceData], warnings: list[str]
+) -> list[OspfRouterLsa]:
+    """Collapse every observer's copy of a Router LSA into one canonical record.
+
+    Selection when observers disagree about sequence/checksum: the highest
+    sequence number wins (RFC 2328 §13.1 instance ordering), then the lowest
+    age, then a stable ordering by checksum. The disagreement itself is a
+    warning — a stale LSDB on one router is real operational information and is
+    never silently dropped.
+    """
+    grouped: dict[LsaIdentity, list[OspfRouterLsa]] = defaultdict(list)
+    for device in devices:
+        for lsa in device.router_lsas:
+            identity = LsaIdentity(
+                area=lsa.area,
+                lsa_type=1,
+                link_state_id=lsa.link_state_id,
+                advertising_router=lsa.advertising_router,
+            )
+            # The observer is the device whose LSDB produced this copy. Fall
+            # back to the enclosing device so provenance is never empty.
+            if not lsa.device_id:
+                lsa.device_id = device.device_id
+            grouped[identity].append(lsa)
+
+    canonical: list[OspfRouterLsa] = []
+    for identity in sorted(
+        grouped, key=lambda i: (i.area, i.advertising_router, i.link_state_id)
+    ):
+        copies = grouped[identity]
+        observers = sorted({c.device_id for c in copies if c.device_id})
+
+        chosen = sorted(
+            copies,
+            key=lambda c: (
+                -(_sequence_value(c.sequence) or -1),
+                _age_value(c.age),
+                c.checksum,
+            ),
+        )[0]
+
+        versions = {
+            (c.sequence, c.checksum) for c in copies if c.sequence or c.checksum
+        }
+        if len(versions) > 1:
+            detail = ", ".join(
+                f"{c.device_id or '?'}={c.sequence or '?'}/{c.checksum or '?'}"
+                for c in sorted(copies, key=lambda c: c.device_id)
+            )
+            warnings.append(
+                f"OSPF LSDB disagreement on {identity.describe()}: observers report "
+                f"different instances ({detail}); the highest sequence "
+                f"({chosen.sequence or 'unknown'}) was used and the conflict is "
+                "preserved here rather than resolved silently"
+            )
+
+        # Re-emit the chosen instance as the canonical record, carrying the full
+        # observer set. A copy built from one device is not mutated in place:
+        # the original objects stay owned by their observer.
+        canonical.append(
+            chosen.model_copy(
+                update={"observed_by": observers, "device_id": chosen.device_id}
+            )
+        )
+    return canonical
+
+
+def canonical_network_lsas(
+    devices: list[OspfDeviceData], warnings: list[str]
+) -> list[OspfNetworkLsa]:
+    """Collapse every observer's copy of a Network LSA into one canonical record.
+
+    Attached-router lists are unioned: if two routers' copies of the same
+    Network LSA disagree about membership, both views are kept and the
+    disagreement is reported, rather than one observer being trusted.
+    """
+    grouped: dict[LsaIdentity, list[OspfNetworkLsa]] = defaultdict(list)
+    for device in devices:
+        for lsa in device.network_lsas:
+            identity = LsaIdentity(
+                area=lsa.area,
+                lsa_type=2,
+                link_state_id=lsa.link_state_id,
+                advertising_router=lsa.advertising_router,
+            )
+            if not lsa.device_id:
+                lsa.device_id = device.device_id
+            grouped[identity].append(lsa)
+
+    canonical: list[OspfNetworkLsa] = []
+    for identity in sorted(
+        grouped, key=lambda i: (i.area, i.link_state_id, i.advertising_router)
+    ):
+        copies = grouped[identity]
+        observers = sorted({c.device_id for c in copies if c.device_id})
+        chosen = sorted(
+            copies,
+            key=lambda c: (
+                -(_sequence_value(c.sequence) or -1),
+                _age_value(c.age),
+                c.checksum,
+            ),
+        )[0]
+
+        versions = {
+            (c.sequence, c.checksum) for c in copies if c.sequence or c.checksum
+        }
+        if len(versions) > 1:
+            detail = ", ".join(
+                f"{c.device_id or '?'}={c.sequence or '?'}/{c.checksum or '?'}"
+                for c in sorted(copies, key=lambda c: c.device_id)
+            )
+            warnings.append(
+                f"OSPF LSDB disagreement on {identity.describe()}: observers report "
+                f"different instances ({detail}); the highest sequence "
+                f"({chosen.sequence or 'unknown'}) was used and the conflict is "
+                "preserved here rather than resolved silently"
+            )
+
+        membership_views = {
+            frozenset(c.attached_routers) for c in copies if c.attached_routers
+        }
+        if len(membership_views) > 1:
+            warnings.append(
+                f"OSPF LSDB disagreement on {identity.describe()}: observers report "
+                "different attached-router lists; the union is used so no member "
+                "is lost"
+            )
+        attached = sorted({r for c in copies for r in c.attached_routers})
+
+        canonical.append(
+            chosen.model_copy(
+                update={
+                    "attached_routers": attached,
+                    "observed_by": observers,
+                    "device_id": chosen.device_id,
+                }
+            )
+        )
+    return canonical
+
+
 def _transit_key(area: str, dr_address: str) -> tuple[str, str]:
     """The join key between a Type-1 transit link and a Type-2 LSA."""
     return (area, dr_address)
@@ -355,10 +546,24 @@ def reconstruct_point_to_point_edges(
 def reconstruct_stub_networks(
     router_lsas: list[OspfRouterLsa],
 ) -> list[OspfStubNetwork]:
-    """Every stub link becomes a prefix owned by its advertising router.
+    """Every Stub Link in every Router LSA becomes one advertised prefix.
 
-    Stub networks never create routers or edges — they are prefix ownership
-    statements, nothing more.
+    **The contract, stated once.** A Stub Network is ``(prefix, advertising
+    router, area, metric)`` exactly as the Type-1 LSA advertises it. It is the
+    LSDB's statement that *this router owns this prefix on-link*.
+
+    This is a different fact from "the prefix is a locally connected subnet",
+    and the two must not be conflated in either direction:
+
+    * a prefix that is both (e.g. ``10.0.12.0/30`` on R2) appears **once** here,
+      because the LSA advertises it — the fact that it is also an interface
+      subnet changes nothing and must not suppress it;
+    * a prefix that is an interface subnet but that the router does **not**
+      advertise as a stub link is absent, because the LSDB does not claim it.
+
+    Stub links never create routers or edges — they are prefix-ownership
+    statements, nothing more, and ``OspfStubNetwork`` deliberately has no
+    member/DR fields so it cannot be mistaken for a segment.
     """
     stubs: list[OspfStubNetwork] = []
     seen: set[tuple[str, str, str]] = set()
@@ -384,6 +589,50 @@ def reconstruct_stub_networks(
                 )
             )
     return stubs
+
+
+def _originator_is_self(device: OspfDeviceData, lsa: OspfRouterLsa) -> bool:
+    """Did ``device`` originate ``lsa``, or merely hold a copy of it?
+
+    Attribution rule, stated once so it cannot drift:
+
+    * if the device reported its own router-id (``show ip ospf``), only the LSA
+      whose Advertising Router equals that id is its own;
+    * if it did not, fall back to interface evidence: a router advertises its
+      attached networks as links in its own LSA, so an LSA whose stub links
+      match an interface address of this device is very likely its own. This is
+      inference, and inference is named as such in the docs — the primary path
+      is the explicit router-id.
+
+    Everything else in the LSDB belongs to some other router.
+    """
+    if device.router_id:
+        return lsa.advertising_router == device.router_id
+    own_addresses = {
+        iface.ip_address for iface in device.interfaces if iface.device_id == device.device_id
+    }
+    if not own_addresses:
+        return False
+    for link in lsa.links:
+        if link.link_data in own_addresses:
+            return True
+    return False
+
+
+def advertised_stub_links(router_lsas: list[OspfRouterLsa]) -> set[tuple[str, str, str]]:
+    """Every ``(area, advertising_router, prefix)`` a Router LSA advertises as a stub.
+
+    The ground truth for the stub contract: whatever appears here must also
+    appear in :func:`reconstruct_stub_networks`, and nothing else may.
+    """
+    advertised: set[tuple[str, str, str]] = set()
+    for lsa in router_lsas:
+        for link in lsa.links:
+            if link.link_type is not OspfLinkType.STUB:
+                continue
+            if link.prefix:
+                advertised.add((lsa.area, lsa.advertising_router, link.prefix))
+    return advertised
 
 
 # --------------------------------------------------------------------------- #
@@ -412,11 +661,7 @@ def build_ospf_topology(
         topology.neighbors.extend(device.neighbors)
         topology.interfaces.extend(device.interfaces)
         topology.database_summary.extend(device.database_summary)
-        topology.router_lsas.extend(device.router_lsas)
-        topology.network_lsas.extend(device.network_lsas)
         topology.routes.extend(device.routes)
-        router_lsas.extend(device.router_lsas)
-        network_lsas.extend(device.network_lsas)
 
         if device.process_id or device.router_id:
             areas = sorted({i.area for i in device.interfaces if i.area})
@@ -441,14 +686,39 @@ def build_ospf_topology(
                     for area in sorted(by_area) or areas
                 ]
 
+    # --- canonical LSAs ---------------------------------------------------- #
+    # An area's LSDB is flooded: every observer holds the same LSAs. Collapse
+    # the copies to one canonical record per LSA identity *before* anything is
+    # reconstructed from them, otherwise the topology is multiplied by the
+    # number of devices that happened to be collected. Observer provenance is
+    # carried on the canonical record's ``observed_by``.
+    router_lsas = canonical_router_lsas(devices, warnings)
+    network_lsas = canonical_network_lsas(devices, warnings)
+    topology.router_lsas = router_lsas
+    topology.network_lsas = network_lsas
+
     # --- routers ---------------------------------------------------------- #
     router_ids: dict[str, set[str]] = defaultdict(set)     # router_id -> devices
     process_ids: dict[str, set[str]] = defaultdict(set)
     areas_by_router: dict[str, set[str]] = defaultdict(set)
 
+    # A device's own router-id is the one *it* reports about itself:
+    #   * the router-id line of its own `show ip ospf` output, and
+    #   * the Router LSA it *originated* in its own LSDB.
+    #
+    # It is emphatically NOT every Router LSA in its LSDB: an area is flooded,
+    # so every router holds all five LSAs. Treating "I can see it" as "I am it"
+    # credited all five router-ids to the first device collected and marked
+    # four uncollected routers as collected.
     for device in devices:
-        own = [lsa.advertising_router for lsa in device.router_lsas if lsa.device_id == device.device_id]
-        candidates = {device.router_id, *own} - {""}
+        originated = {
+            lsa.advertising_router
+            for lsa in device.router_lsas
+            # Observer == originator only for the device's *own* LSA.
+            if lsa.device_id == device.device_id
+            and _originator_is_self(device, lsa)
+        }
+        candidates = {device.router_id, *originated} - {""}
         for router_id in candidates:
             router_ids[router_id].add(device.device_id)
             if device.process_id:
@@ -480,17 +750,21 @@ def build_ospf_topology(
     topology.stub_networks = reconstruct_stub_networks(router_lsas)
 
     # --- honesty notes ----------------------------------------------------- #
+    # Computed once, before it is needed: the previous version assigned this
+    # inside the ``if not router_lsas`` branch and then read it further down,
+    # which raised UnboundLocalError on every run that did have Router LSAs.
+    any_ospf_signal = bool(
+        topology.neighbors
+        or topology.interfaces
+        or topology.database_summary
+        or topology.network_lsas
+        or topology.router_lsas
+        or topology.routes
+    )
     if not router_lsas:
         # Two very different situations, both reported precisely:
         #   * nothing OSPF-shaped arrived at all -> the device does not run OSPF
         #   * OSPF answered but the LSDB had no Router LSAs -> evidence gap
-        any_ospf_signal = bool(
-            topology.neighbors
-            or topology.interfaces
-            or topology.database_summary
-            or topology.network_lsas
-            or topology.routes
-        )
         if not any_ospf_signal:
             warnings.append(
                 "no OSPF evidence collected — this device does not appear to run OSPF, "

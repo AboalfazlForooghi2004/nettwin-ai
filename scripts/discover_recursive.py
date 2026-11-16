@@ -92,6 +92,28 @@ def _ospf_audit(ospf) -> dict:  # noqa: ANN001 - OspfTopology | None
              "advertising_router": s.advertising_router, "metric": s.metric}
             for s in ospf.stub_networks
         ],
+        "router_lsas": [
+            {
+                "area": lsa.area,
+                "link_state_id": lsa.link_state_id,
+                "advertising_router": lsa.advertising_router,
+                "sequence": lsa.sequence,
+                "checksum": lsa.checksum,
+                "observed_by": lsa.observed_by,
+            }
+            for lsa in ospf.router_lsas
+        ],
+        "network_lsas": [
+            {
+                "area": lsa.area,
+                "link_state_id": lsa.link_state_id,
+                "advertising_router": lsa.advertising_router,
+                "prefix": lsa.prefix,
+                "attached_routers": lsa.attached_routers,
+                "observed_by": lsa.observed_by,
+            }
+            for lsa in ospf.network_lsas
+        ],
         "logical_edges": [
             {
                 "source_router_id": e.source_router_id,
@@ -117,6 +139,7 @@ def _ospf_audit(ospf) -> dict:  # noqa: ANN001 - OspfTopology | None
             "connected": len(ospf.connected_routes()),
             "note": "routing evidence; never used to create a topology link",
         },
+        "lsa_counts": ospf.lsa_counts(),
         "state_counts": ospf.state_counts(),
         "warnings": ospf.warnings,
     }
@@ -326,10 +349,20 @@ def main(argv: list[str] | None = None) -> int:
             state_word = ", ".join(f"{k} {v}" for k, v in sorted(states.items())) or "none"
             print(
                 f"ospf       : {len(ospf.routers)} router(s), "
+                f"{len(ospf.router_lsas)} unique Router LSA(s), "
+                f"{len(ospf.network_lsas)} unique Network LSA(s), "
                 f"{len(ospf.transit_networks)} transit network(s), "
                 f"{len(ospf.stub_networks)} stub prefix(es), "
                 f"{len(ospf.learned_routes())} learned route(s) — {state_word}"
             )
+            counts = ospf.lsa_counts()
+            if counts["observers"] > 1:
+                print(
+                    f"             {counts['observers']} observers shared these LSAs: "
+                    f"{counts['router_lsa_observations']} Router LSA + "
+                    f"{counts['network_lsa_observations']} Network LSA observations "
+                    "collapsed to one canonical copy each"
+                )
 
         # Visualizations are rendered from the normalized topology only, so a
         # drawing can never show more than the collected evidence supports.

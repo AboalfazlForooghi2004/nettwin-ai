@@ -623,12 +623,61 @@ def parse_show_ip_ospf_database_network(
 # show ip ospf route
 # --------------------------------------------------------------------------- #
 
-#: "10.0.34.0/30   11   Intra   via 10.0.23.2   Et0/0"
-_ROUTE_ROW_RE = re.compile(
+# Real IOS prints ``show ip ospf route`` as comma-separated rows with the next
+# hop on the *following* line:
+#
+#     Intra-area Route List
+#   *   192.168.20.0/30, Intra, cost 64, area 0, Connected
+#         via 192.168.20.1, Serial0/1
+#   *>  192.168.10.64/26, Inter, cost 138, area 0
+#         via 192.168.20.2, Serial0/1
+#
+# The older fixtures in this repository used a whitespace-aligned table, which
+# this command does not actually emit. Both shapes are accepted: the comma form
+# is what a live device produces, and dropping the old one would break any
+# transcript captured before this was corrected.
+_COMMA_ROUTE_RE = re.compile(
+    r"^(?P<flags>\*?>?)\s*"
+    r"(?P<prefix>\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\s*,\s*"
+    r"(?P<type>[A-Za-z][A-Za-z0-9\-]*)\s*,\s*"
+    r"cost\s+(?P<metric>\d+)"
+    r"(?P<rest>.*)$"
+)
+
+#: "10.0.34.0/30   11   Intra   via 10.0.23.2   Et0/0"  (legacy aligned table)
+_TABLE_ROUTE_RE = re.compile(
     r"^(?P<prefix>\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\s+"
     r"(?P<metric>\d+)\s+"
     r"(?P<type>[A-Za-z][A-Za-z0-9\-]*)\s+"
     r"(?P<rest>.*)$"
+)
+
+#: "      via 192.168.20.1, Serial0/1"  /  "via 10.0.23.2  Et0/0"
+_VIA_RE = re.compile(
+    r"^via\s+(?P<hop>\d{1,3}(?:\.\d{1,3}){3})"
+    r"(?:\s*,\s*|\s+)(?P<intf>[^,\s]+(?:\s+[^,\s]+)*?)?\s*$",
+    re.IGNORECASE,
+)
+
+#: "      via 192.168.20.1, Serial0/1, cost 20"  (ECMP / repair path variants)
+_VIA_EXTRA_RE = re.compile(r"^via\s+", re.IGNORECASE)
+
+#: Lines that are structure, not data.
+#:
+#: ``Intra-area Router Path List`` rows start with ``i``/``I`` and describe
+#: routes to *routers* (``i 1.1.1.1 [10] via …``), not prefixes, so they are not
+#: routes and must not be turned into any.
+_ROUTE_STRUCTURE_RE = re.compile(
+    r"^(?:"
+    r"\*?\s*(?:Intra-area|Inter-area|External)\s+Route\s+List"
+    r"|(?:Intra-area|Inter-area|External)\s+Router\s+Path\s+List"
+    r"|First\s+Hop\s+Forwarding\s+Gateway\s+Tree"
+    r"|SPF\s+Instance\b"
+    r"|Flags\s*:"
+    r"|LSA\s*:"
+    r"|repair\s+path\b"
+    r")",
+    re.IGNORECASE,
 )
 
 _TYPE_MAP: dict[str, OspfRouteType] = {
@@ -646,16 +695,55 @@ def _classify_route_type(raw: str) -> OspfRouteType:
     return _TYPE_MAP.get(raw.strip().lower(), OspfRouteType.UNKNOWN)
 
 
+_AREA_TOKEN_RE = re.compile(r"area\s+(?P<area>[0-9A-Za-z.]+)", re.IGNORECASE)
+_TAG_RE = re.compile(r"tag\s+(?P<tag>\d+)", re.IGNORECASE)
+
+
+def _area_from_header(line: str) -> str | None:
+    """``Area 0`` / ``Area BACKBONE(0)`` / ``Area 4`` -> the area id."""
+    match = _AREA_HEADER_RE.match(line)
+    if match:
+        return match.group(1)
+    backbone = re.match(
+        r"^\s*Area\s+BACKBONE\((?P<area>[0-9A-Za-z.]+)\)\s*$", line, re.IGNORECASE
+    )
+    if backbone:
+        return backbone.group("area")
+    return None
+
+
+def _interface_from_via(rest: str) -> str:
+    """The outgoing interface from the tail of a ``via`` line."""
+    tail = rest.strip()
+    if not tail:
+        return ""
+    # "via 10.0.23.2, Ethernet0/0" -> "Ethernet0/0"
+    if "," in tail:
+        parts = [p.strip() for p in tail.split(",")]
+        for part in parts[1:]:
+            if part and not _TAG_RE.match(part) and not part.lower().startswith("cost"):
+                return part
+        return ""
+    tokens = tail.split()
+    return tokens[-1] if tokens else ""
+
+
 def parse_show_ip_ospf_route(
     text: str, device_id: str = ""
 ) -> tuple[list[OspfRoute], list[str]]:
     """Parse ``show ip ospf route``.
 
-    ``Connected`` rows are the device's own interface networks; they are marked
-    ``learned=False`` so they can never be counted as OSPF-learned. Several
-    equal-cost next hops are printed as extra ``via`` lines under one prefix —
-    only the first is kept in the single ``next_hop`` field and the rest are
-    reported.
+    Handles both output shapes a Cisco IOS router can produce for this command:
+
+    * the comma form (``<prefix>, <Type>, cost <n>, area <a>[, Connected]`` with
+      the next hop on the following ``via`` line) — what real devices print;
+    * the legacy whitespace-aligned table used by older fixtures.
+
+    ``Connected`` rows describe the device's *own* interface networks and are
+    marked ``learned=False``; they are OSPF state but never OSPF-*learned*, and
+    keeping them apart is what stops a route count from being inflated. Extra
+    next hops on an equal-cost route are reported, not merged: the model holds
+    one next hop, and silently picking one would lose the others.
     """
     routes: list[OspfRoute] = []
     warnings: list[str] = []
@@ -663,64 +751,108 @@ def parse_show_ip_ospf_route(
         return routes, ["show ip ospf route: empty output"]
 
     area = ""
+    # The row currently awaiting a ``via`` line, if any.
+    pending: OspfRoute | None = None
+
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
-        area_line = _AREA_HEADER_RE.match(line)
-        if area_line and not line.lower().startswith("area border"):
-            area = area_line.group(1)
-            continue
-        if line.lower().startswith(("prefix", "base topology", "ospf router")):
+
+        header_area = _area_from_header(line)
+        if header_area is not None:
+            area = header_area
             continue
 
-        match = _ROUTE_ROW_RE.match(line)
-        if not match:
-            if line.lower().startswith("via"):
+        if line.lower().startswith(("prefix", "base topology", "ospf router", "codes:")):
+            continue
+        if _ROUTE_STRUCTURE_RE.match(line):
+            continue
+
+        # --- a continuation line for the row just parsed -------------------
+        if line.lower().startswith("via"):
+            hop = _VIA_RE.match(line)
+            if hop is None:
+                if _VIA_EXTRA_RE.match(line) and pending is not None:
+                    warnings.append(
+                        "show ip ospf route: extra equal-cost next hop recorded as a "
+                        f"note, not merged: {line!r}"
+                    )
+                continue
+            if pending is None:
                 warnings.append(
-                    f"show ip ospf route: extra equal-cost next hop ignored {line!r} "
+                    f"show ip ospf route: 'via' line without a route row skipped: {line!r}"
+                )
+                continue
+            if pending.next_hop is None:
+                pending.next_hop = hop.group("hop")
+                interface = hop.group("intf")
+                if interface:
+                    pending.outgoing_interface = interface.strip()
+            else:
+                warnings.append(
+                    "show ip ospf route: additional equal-cost next hop "
+                    f"{hop.group('hop')} for {pending.prefix} reported, not merged "
                     "(the model holds one next hop)"
                 )
             continue
 
+        # --- a route row ---------------------------------------------------
+        match = _COMMA_ROUTE_RE.match(line) or _TABLE_ROUTE_RE.match(line)
+        if not match:
+            continue
+
         raw_type = match.group("type")
         route_type = _classify_route_type(raw_type)
+        rest = match.group("rest") or ""
+
+        # Real IOS prints a local interface network as
+        #     "*  10.0.23.0/30, Intra, cost 1, area 0, Connected"
+        # so the *type* column says Intra and the ``Connected`` suffix is what
+        # actually tells us this is not a learned route. Reading only the type
+        # column would count every connected network as an OSPF-learned route.
+        if re.search(r"\bConnected\b", rest, re.IGNORECASE):
+            route_type = OspfRouteType.CONNECTED
+
         if route_type is OspfRouteType.UNKNOWN:
             warnings.append(
                 f"show ip ospf route: unmapped route type {raw_type!r} for "
                 f"{match.group('prefix')}"
             )
+        row_area = area
+        area_match = _AREA_TOKEN_RE.search(rest)
+        if area_match:
+            row_area = area_match.group("area")
 
-        rest = match.group("rest")
         next_hop: str | None = None
         outgoing = ""
-        via = re.search(r"via\s+(\d{1,3}(?:\.\d{1,3}){3})(?:\s+(\S+))?", rest)
-        if via:
-            next_hop = via.group(1)
-            outgoing = via.group(2) or ""
-        else:
-            local = re.search(r"in\s+(\d{1,3}(?:\.\d{1,3}){3})", rest)
-            if local:
-                outgoing = rest.split()[-1] if rest.split() else ""
-        # Interface is always the last token of the row when present.
-        tokens = rest.split()
-        if tokens and not _is_ipv4(tokens[-1]) and not tokens[-1].startswith("via"):
-            outgoing = tokens[-1]
-
-        routes.append(
-            OspfRoute(
-                device_id=device_id,
-                prefix=match.group("prefix"),
-                route_type=route_type,
-                cost=_to_int(match.group("metric")),
-                next_hop=next_hop,
-                outgoing_interface=outgoing,
-                area=area,
-                # A *Connected* row is local interface state, not a learned route.
-                learned=route_type is not OspfRouteType.CONNECTED,
-                raw_type=raw_type,
-            )
+        # A ``via`` may still sit on the same line in the legacy table form.
+        inline = re.search(
+            r"via\s+(\d{1,3}(?:\.\d{1,3}){3})(?:\s*,\s*|\s+)([^,\s]+)?", rest
         )
+        if inline:
+            next_hop = inline.group(1)
+            outgoing = (inline.group(2) or "").strip()
+        elif not re.search(r"\bConnected\b", rest, re.IGNORECASE):
+            local = re.search(r"\bin\s+(\d{1,3}(?:\.\d{1,3}){3})", rest)
+            if local:
+                tokens = rest.split()
+                outgoing = tokens[-1] if tokens else ""
+
+        route = OspfRoute(
+            device_id=device_id,
+            prefix=match.group("prefix"),
+            route_type=route_type,
+            cost=_to_int(match.group("metric")),
+            next_hop=next_hop,
+            outgoing_interface=outgoing,
+            area=row_area,
+            # A *Connected* row is local interface state, not a learned route.
+            learned=route_type is not OspfRouteType.CONNECTED,
+            raw_type=raw_type,
+        )
+        routes.append(route)
+        pending = route
 
     if not routes:
         warnings.append("show ip ospf route: no route rows parsed")

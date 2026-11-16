@@ -1,0 +1,279 @@
+# Phase 2.6 — Root cause analysis (pre-implementation)
+
+Written before any code change, per the task's execution workflow §7.2.
+
+---
+
+## A. Duplicate LSAs and transit networks (25 instead of 5)
+
+**Symptom.** Five routers, each reporting the same five Type-2 LSAs, produce 25
+Network LSAs and 25 Transit Networks.
+
+**Root cause.** `build_ospf_topology()` concatenates every device's records into
+flat lists and hands the concatenation to the reconstruction functions:
+
+```python
+topology.router_lsas.extend(device.router_lsas)     # 5 observers × 5 LSAs
+topology.network_lsas.extend(device.network_lsas)
+router_lsas.extend(device.router_lsas)
+network_lsas.extend(device.network_lsas)
+```
+
+There is **no canonicalisation step anywhere**. Whether a consumer multiplies
+depends on whether each *reconstruction* function happens to dedupe:
+
+| Function | Dedupe? | Result with 5 observers |
+|---|---|---|
+| `reconstruct_stub_networks` | yes — `(area, adv_router, prefix)` | 7 ✅ |
+| `reconstruct_transit_networks` | **no** — one object per Type-2 record | 25 ❌ |
+| `reconstruct_point_to_point_edges` | no (but no P2P links here) | — |
+
+So the bug is not "transit reconstruction is wrong"; it is that **the LSDB is a
+set shared by many observers and the model has no notion of that**. The
+per-function dedupe made one symptom invisible and the other visible.
+
+**Fix.** Introduce an explicit canonical-LSA layer *before* reconstruction:
+
+- An LSA's identity is `(area, lsa_type, link_state_id, advertising_router)` —
+  exactly what the task specifies, and exactly the OSPF LSA identity
+  (LS type, Link State ID, Advertising Router) scoped by area.
+- Observer provenance is a separate axis: `observed_by` is the set of devices
+  whose LSDB contained that LSA. Nothing is discarded.
+- Sequence/checksum differences for the same identity are **not** collapsed
+  silently: the canonical copy keeps the highest sequence number (RFC 2328
+  §13.1 instance ordering) and a warning records that the observers disagreed,
+  naming each observer's sequence.
+
+## B. Missing device attribution
+
+**Root cause, two independent defects.**
+
+1. In `_observations_from()`, the dispatch loop calls every parser as
+   `parser(text)`. The OSPF parsers take `(text, device_id)`, so `device_id`
+   silently defaults to `""`. `parse_show_ip_ospf_interface_brief`,
+   `…_database_router`, `…_database_network` and `…_route` all therefore
+   produce rows with an empty `device_id`.
+
+   The CDP and `show ip route` parsers keep working because they are
+   single-argument parsers — which is why only OSPF was affected.
+
+2. `_attach_ospf()` copies `item.model_dump()` straight onto observations, which
+   faithfully preserves that empty id, and `ospf_device_data()` re-validates the
+   rows without ever filling it in. `_lsa_ref()` then does
+   `device_id=lsa.device_id or "unknown"`, which is how
+   `device_id="unknown"` reached the transit LSA references.
+
+**Note on identity.** The observing device and the LSA's *Advertising Router* are
+different things and must not be conflated: R2's LSDB contains R2-1's Router LSA,
+so `device_id="r2"` while `advertising_router="10.255.255.1"`. The fix attributes
+the observer and leaves the advertising router alone.
+
+**`OspfLsaSummary`.** `show ip ospf database` is a *summary of the LSDB*, so every
+row is likewise something the device observed rather than originated. The model
+has no observer field; it is extended with `device_id: str = ""`, which is
+backward compatible (defaulted, and `extra="forbid"` means nothing else changes).
+
+## C. OSPF routes missing from live output
+
+**Root cause: the parser's row regex does not match real Cisco IOS output.**
+
+`parse_show_ip_ospf_route()` expects a tabular row:
+
+```
+10.0.23.0/30         1       Connected  in 10.0.23.1     Et0/0
+```
+
+That shape is what the hand-written fixture contains, but it is **not** what
+`show ip ospf route` prints. Real IOS prints comma-separated rows with the
+next hop on its own line (Cisco IOS IP Routing: OSPF Command Reference):
+
+```
+    Intra-area Route List
+*   192.168.20.0/30, Intra, cost 64, area 0, Connected
+      via 192.168.20.1, Serial0/1
+*>  192.168.10.64/26, Inter, cost 138, area 0
+      via 192.168.20.2, Serial0/1
+```
+
+Against real output the regex matches nothing, the parser returns an empty list
+with a warning, and the warning is swallowed into `observations.warnings` — so
+`OspfTopology.routes` is empty on a live device while an offline fixture test
+passes. The fixture was written to match the parser instead of the parser being
+written to match the device, which is exactly how this class of bug hides.
+
+Additional real-IOS shapes that must also work:
+
+- `Codes: …` legend lines (already skipped)
+- `Area BACKBONE(0)` and `Area 4` headers
+- section headers: `Intra-area Route List`, `Inter-area Route List`,
+  `External Route List`, `Intra-area Router Path List`
+- `Intra-area Router Path List` rows (`i 1.1.1.1 [10] via …`) are **not** routes
+- `via` lines, including several ECMP `via` lines per prefix
+- `tag 0` on external routes
+- `SPF Instance`/`Flags:`/`LSA:` continuation lines that are not routes
+
+**Fix.** Rewrite the route parser to consume the comma form and keep the old
+tabular form working (harmless, and it keeps older fixtures/transcripts valid).
+The fixture itself is corrected to real IOS output so the tests exercise reality.
+
+## D. Stub prefix count: 7 vs 8
+
+**The fixture advertises 7 stub links, and the task's "8" appears to be an
+off-by-one.** Verified by parsing, not by assumption:
+
+| Advertising router | Stub links in its Router LSA |
+|---|---|
+| 10.255.255.1 | `192.168.98.32/27` (metric 1) |
+| 10.255.255.2 | `10.255.255.2/32`, `10.0.12.0/30`, `10.0.12.4/30` |
+| 10.255.255.3 | `10.255.255.3/32` |
+| 10.255.255.4 | `10.255.255.4/32` |
+| 10.255.255.5 | `10.255.255.5/32` |
+
+That is seven, and **`10.255.255.1/32` is not among them**: R2-1's Router LSA
+carries two transit links and one stub link (`192.168.98.32/27`), with no
+loopback stub. The task's list of eight includes `10.255.255.1/32`, which the
+fixture does not contain.
+
+Two independent cross-checks confirm the fixture is self-consistent rather than
+truncated:
+
+- Routes to `10.255.255.2…5/32` are direct (`Connected`, cost 1); the route to
+  `10.255.255.1/32` is *learned* at cost 22 via `10.0.23.2`, i.e. R2-1's loopback
+  is reached across the topology, not advertised as a stub on-link.
+- R2-1's `192.168.98.32/27` is the management segment R2 itself sits in.
+
+**Action taken: none on the fixture.** Rewriting a captured-LSDB fixture to add
+a stub link that the device did not advertise would fabricate LSDB evidence —
+the one thing this phase must never do. The contract is documented and
+**machine-enforced**: every Stub Link present in a Router LSA must appear in
+`stub_networks`, and no stub may be dropped because its prefix is also a
+connected interface (a new test asserts `10.0.12.0/30` and `10.0.12.4/30`,
+which are also R2's own connected subnets, are still present).
+
+If the real PNETLab LSDB does carry an eighth stub, it will be reconstructed
+automatically — the code has no count constant anywhere.
+
+## E. Latent bug found while reading: `any_ospf_signal` unbound
+
+In `build_ospf_topology()`, `any_ospf_signal` is assigned only inside the
+`if not router_lsas:` branch but read later by
+`if not topology.neighbors and devices and any_ospf_signal:`. When Router LSAs
+*are* present the name is unbound — `UnboundLocalError`, which would take out
+the whole OSPF section. It has not fired only because every exercised path so
+far had either no devices or no neighbours. Fixed as part of this work.
+
+## F. Summary counters are ambiguous
+
+`_assemble_topology` and the CLI report raw list lengths, so a 5-router run
+prints "25 transit network(s)". Counters must distinguish *observed* (records,
+including duplicates across observers) from *canonical* (unique LSAs) and
+*reconstructed* (unique logical objects).
+
+---
+
+## Outcome — what was actually changed
+
+All six defects were fixed in place; nothing was rewritten from scratch and no
+physical-topology behaviour changed.
+
+### A. Duplicated LSAs (25 → 5)
+
+`build_ospf_topology()` concatenated every device's observations and
+`reconstruct_transit_networks()` emitted one network per Type-2 record, so a
+five-router flood produced 25 LSAs and 25 transit networks. `reconstruct_stub_networks()`
+happened to dedupe on `(area, advertising_router, prefix)`, which is why the
+stub count looked right while everything else was multiplied.
+
+**Fix:** a canonical layer runs between collection and reconstruction.
+
+* `LsaIdentity` = `(area, lsa_type, link_state_id, advertising_router)`.
+* `canonical_router_lsas()` / `canonical_network_lsas()` collapse copies.
+* The winner is chosen by the RFC 2328 §13.1 ordering — newest sequence
+  instance, then lowest age, then checksum.
+* Network-LSA attached routers are **unioned**, so no observer can hide a member.
+
+`build_ospf_topology()` now assigns `topology.router_lsas` / `.network_lsas` from
+the canonical lists, and reconstruction reads those. Route tables are **not**
+canonicalised: each router's OSPF route table is its own evidence (5 routers ×
+11 routes = 55 is correct, and `learned_routes()` = 45).
+
+### A′. Attribution (found while fixing A — this was latent and worse)
+
+`router_ids[router_id].add(device.device_id)` was fed by
+`[lsa.advertising_router for lsa in device.router_lsas if lsa.device_id == device.device_id]`
+— i.e. "every LSA in my LSDB is mine". In a flooded area that credited all five
+router-ids to the first device collected and reported four routers that were
+never SSH'd into as `collected=True`. It also produced ten bogus CDP
+correlations between devices with no physical evidence.
+
+**Fix:** `_originator_is_self()`. A device owns an LSA only if the LSA's
+Advertising Router equals the router-id *that device reported about itself*;
+failing that, interface-address evidence is used, and that fallback is named as
+inference in the docstring. Holding a copy never counts as originating it.
+
+### B. Empty device IDs
+
+The dispatch loop called `parser(text)`, so every ``device_id`` defaulted to
+`""`; `_lsa_ref()` then turned that into `"unknown"`.
+
+**Fix:** `_observations_from()` parses `show version` first, derives the
+device-scoped command set from the parser signatures with `inspect`, and passes
+`device_id` into every parser that accepts it. `ospf_device_data()` backfills
+through `_attributed()`. Verified: zero empty IDs, zero `"unknown"` across
+neighbours, interfaces, both LSA types, routes, stubs, database summary and
+transit source references.
+
+### C. Zero OSPF routes
+
+The parser's table regex could not match real IOS output, which uses the
+resource-string/comma form (`*  192.168.20.0/30, Intra, cost 64, area 0, Connected`
+with a `via …` continuation). The fixture had been hand-written to fit the
+parser, so the tests passed while a real router produced nothing. The loss was
+silent: a warning went into `observations.warnings` and `routes` came back empty.
+
+**Fix:** the parser accepts the real format (legacy tabular retained), and the
+fixture is now genuine IOS output. Connected networks print their type as
+`Intra` and are distinguished **only** by the `Connected` suffix, so that
+suffix overrides the type column — otherwise every connected network counts as
+learned.
+
+### Counters
+
+`OspfTopology.lsa_counts()` reports identities and observations separately
+(`router_lsas: 5`, `router_lsa_observations: 25`, `observers: 5`), and both the
+CLI and the renderer payload use it. The CLI additionally prints a line naming
+the multiplicity. A run can no longer say "25 transit networks" when there are
+five.
+
+### Stub contract (§2) — seven, and the distinction is the point
+
+A **Stub Network** is `(prefix, advertising router, area, metric)` exactly as a
+Type-1 LSA advertises it: the LSDB's statement that a router owns a prefix
+on-link. It is *not* a statement about interface configuration. The two are kept
+separate in both directions:
+
+* `10.0.12.0/30` and `10.0.12.4/30` are advertised **and** configured on R2 — they
+  appear, because the LSA advertises them. Being a connected subnet never
+  suppresses a stub.
+* `10.255.255.1/32` is an interface subnet somewhere but is **not** advertised as
+  a stub, so it does not appear. R2 reaches it as a learned route at cost 22.
+
+`advertised_stub_links()` exposes the ground truth, and a test asserts
+`advertised_stub_links(lsas) == {(s.area, s.advertising_router, s.prefix) for s in reconstruct_stub_networks(lsas)}`
+— so the reconstruction can never drift from the LSDB in either direction.
+**The lab yields 7 stubs.** An eighth would need an eighth advertised link; the
+code has no count constant, so one would reconstruct automatically.
+
+### Latent bug
+
+`any_ospf_signal` was assigned inside `if not router_lsas:` and read later,
+raising `UnboundLocalError` on every run that *did* have Router LSAs. Now
+computed once, before use.
+
+## Verification
+
+* `690 passed` (649 before + 41 new in `tests/test_ospf_lsdb_integrity.py`).
+* `ruff check .` clean.
+* Reference lab through the real pipeline: 5 router LSAs, 5 network LSAs,
+  5 transit networks, 7 stubs, 11 routes on R2 (9 learned / 2 Connected),
+  0 missing device IDs, `logical_edges=0` (no reciprocal P2P links exist).

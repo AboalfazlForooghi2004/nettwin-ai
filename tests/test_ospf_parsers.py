@@ -454,14 +454,17 @@ def test_parse_ospf_routes_real_lab() -> None:
 @pytest.mark.parametrize(
     ("prefix", "route_type", "cost", "next_hop"),
     [
-        ("10.0.23.0/30", OspfRouteType.CONNECTED, 1, None),
+        # Real IOS prints a via line for Connected rows too — the local address
+        # and interface are real device output, so they are kept rather than
+        # suppressed. ``learned`` is what distinguishes them, not a null hop.
+        ("10.0.23.0/30", OspfRouteType.CONNECTED, 1, "10.0.23.1"),
         ("10.0.34.0/30", OspfRouteType.INTRA_AREA, 11, "10.0.23.2"),
         ("10.0.32.0/30", OspfRouteType.INTRA_AREA, 11, "10.0.23.2"),
         ("10.0.21.0/30", OspfRouteType.INTRA_AREA, 21, "10.0.23.2"),
         ("10.0.41.0/30", OspfRouteType.INTRA_AREA, 21, "10.0.23.2"),
         ("192.168.98.32/27", OspfRouteType.INTRA_AREA, 31, "10.0.23.2"),
         ("10.255.255.1/32", OspfRouteType.INTRA_AREA, 22, "10.0.23.2"),
-        ("10.255.255.2/32", OspfRouteType.CONNECTED, 1, None),
+        ("10.255.255.2/32", OspfRouteType.CONNECTED, 1, "10.255.255.2"),
         ("10.255.255.3/32", OspfRouteType.INTRA_AREA, 12, "10.0.23.2"),
         ("10.255.255.4/32", OspfRouteType.INTRA_AREA, 2, "10.0.23.2"),
         ("10.255.255.5/32", OspfRouteType.INTRA_AREA, 12, "10.0.23.2"),

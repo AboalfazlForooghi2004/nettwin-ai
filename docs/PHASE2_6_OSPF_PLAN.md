@@ -192,7 +192,9 @@ Integration, all edit-in-place rather than parallel copies:
 
 ### Verification
 
-* `pytest tests/` — **633 passed** (475 at Phase 2.5; +158 this phase).
+* `pytest tests/` — **690 passed** (649 at the start of this fix round; +41 new
+  integrity tests). See `docs/PHASE2_6_ROOT_CAUSES.md` for the six defects these
+  tests exist to catch.
 * `ruff check .` — clean.
 * Reference lab reproduced exactly: 5 transit networks, 5 router IDs, 10/10
   member interface addresses, 7 stubs, 11 routes (9 learned + 2 connected),
@@ -208,6 +210,7 @@ Integration, all edit-in-place rather than parallel copies:
 | `tests/test_ospf_recursive.py` | 18 | OSPF inside the real `RecursiveDiscovery.run()` walk |
 | `tests/test_render_ospf.py` | 51 | SVG/HTML structure, the never-a-cable rule, evidence states, XSS |
 | `tests/test_ospf_outputs.py` | 16 | `topology.yaml` / `discovery.yaml` on disk, backward compatibility |
+| `tests/test_ospf_lsdb_integrity.py` | 41 | canonical LSAs vs observations, observer provenance, observer≠Advertising Router, conflicting LSA instances, attribution completeness, route sources kept separate, the documented stub contract, lab acceptance |
 
 ### Known limits (stated, not hidden)
 
@@ -217,3 +220,46 @@ Integration, all edit-in-place rather than parallel copies:
 * Only OSPFv2 for IPv4. OSPFv3, virtual-link transit reconstruction (classified
   and preserved, but not reconstructed into edges) and multi-process correlation
   are represented in the models but not reconstructed end to end.
+
+---
+
+## Phase 2.6 fix round — LSDB canonicalisation, attribution, route reconstruction
+
+Three defects reported from a live five-router run, three more found while
+fixing them. Full root causes and reasoning live in
+`docs/PHASE2_6_ROOT_CAUSES.md`; this is the summary.
+
+| # | Reported symptom | Root cause | Fix |
+|---|---|---|---|
+| A | 25 Router LSAs / 25 Network LSAs / 25 transit networks for 5 of each | nothing canonicalised: every device's copy was concatenated and one transit network emitted per Type-2 record. Stub reconstruction happened to dedupe, hiding half the symptom | canonical LSA layer run before reconstruction; identity = `(area, type, LSID, adv router)`; provenance kept in `observed_by` |
+| A′ | *(found while fixing A)* all router-ids credited to one device; uncollected routers marked `collected`; ten bogus CDP correlations | "this LSA is in my LSDB" was read as "this LSA is mine" | `_originator_is_self()`: own LSA ⇔ Advertising Router ≡ the device's own reported router-id (interface evidence as a documented fallback) |
+| B | 21 interfaces / 25 LSAs with empty `device_id`, transit refs `"unknown"` | dispatch called `parser(text)`; the observer never reached the parser | `show version` parsed first, device-scoped command set derived from parser signatures, `device_id` threaded through; `_attributed()` backfills |
+| C | zero OSPF routes | the parser's table regex could not match real IOS comma-format output; the fixture had been written to fit the parser, so tests passed while the wire format failed — silently | parser accepts the real format; fixture replaced with genuine IOS output; `Connected` suffix overrides the type column |
+| D | `UnboundLocalError` on any run with Router LSAs | `any_ospf_signal` assigned inside `if not router_lsas:` and read later | computed once before use |
+| E | counters could say "25 transit networks" | observed records and canonical identities shared one number | `lsa_counts()` reports identities, observations and observer count separately; CLI and renderer payload both use it |
+
+**Architectural decision.** LSA *identity* and *observation* are now different
+objects. Identity is what the topology is reconstructed from; observation is
+provenance and is preserved on `observed_by`. Conflicting instances are never
+resolved silently: the RFC 2328 §13.1 ordering picks the winner *and* a warning
+names every observer's sequence/checksum. Network-LSA membership is unioned, so
+no observer can hide a member. Route tables are deliberately **not**
+canonicalised — they are per-device evidence, not flooded state.
+
+**Stub contract.** A Stub Network is what a Type-1 LSA advertises, not what is
+configured on an interface. A prefix that is both appears once (the LSDB claims
+it); a configured subnet the router does not advertise does not appear.
+`advertised_stub_links()` is the ground truth and a test pins reconstruction to
+it in both directions. The reference lab yields **7**, and an eighth would
+reconstruct automatically if the evidence ever contained one.
+
+### Fix-round verification
+
+* `pytest tests/` — **690 passed**; `ruff check .` clean.
+* Lab acceptance through the real pipeline with five device-specific observers:
+  5 devices, 5 unique Router LSAs, 5 unique Network LSAs, 5 transit networks,
+  7 stubs, 11 routes per device (9 learned / 2 Connected), 0 missing device IDs,
+  `logical_edges = 0` (no reciprocal point-to-point evidence exists, so this is
+  correct rather than a gap).
+* Physical topology untouched: CDP results are byte-identical with and without
+  OSPF, and a regression test asserts it.

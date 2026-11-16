@@ -248,6 +248,9 @@ def build_ospf_payload(
                 "age": lsa.age,
                 "number_of_links": lsa.number_of_links,
                 "device_id": lsa.device_id,
+                # Provenance: every router whose LSDB held this LSA. One LSA,
+                # several observers — never one LSA per observer.
+                "observed_by": lsa.observed_by,
                 "links": [
                     {
                         "link_type": str(link.link_type),
@@ -273,6 +276,8 @@ def build_ospf_payload(
                 "sequence": lsa.sequence,
                 "checksum": lsa.checksum,
                 "age": lsa.age,
+                "device_id": lsa.device_id,
+                "observed_by": lsa.observed_by,
             }
             for lsa in ospf.network_lsas
         ],
@@ -289,6 +294,21 @@ def build_ospf_payload(
             "connected_routes": len(ospf.connected_routes()),
             "router_lsas": len(ospf.router_lsas),
             "network_lsas": len(ospf.network_lsas),
+            # Separate the LSDB identities from the observations of them, so a
+            # reader is never told "25 transit networks" when there are 5.
+            "router_lsa_observations": sum(
+                len(lsa.observed_by) for lsa in ospf.router_lsas
+            ),
+            "network_lsa_observations": sum(
+                len(lsa.observed_by) for lsa in ospf.network_lsas
+            ),
+            "observers": len(
+                {
+                    observer
+                    for lsa in [*ospf.router_lsas, *ospf.network_lsas]
+                    for observer in lsa.observed_by
+                }
+            ),
         },
         "has_physical": physical is not None,
     }
@@ -618,7 +638,12 @@ function renderEmptyPanel(){
     ["stub prefixes", DATA.counts.stub_networks],
     ["adjacencies", DATA.counts.neighbors],
     ["routes", DATA.counts.routes + " (" + learned + " learned)"],
-    ["Type 1 / Type 2", DATA.counts.router_lsas + " / " + DATA.counts.network_lsas]
+    ["Type 1 / Type 2", DATA.counts.router_lsas + " / " + DATA.counts.network_lsas],
+    ["observers", DATA.counts.observers + (
+      DATA.counts.observers > 1
+        ? " (each LSA seen by up to " + DATA.counts.observers + ", counted once)"
+        : ""
+    )]
   ]));
 }
 
@@ -693,7 +718,12 @@ function build(){
         "a cable here, and only the CDP view can ever place one."));
       if(e.notes.length){ e.notes.forEach(function(n){ side.appendChild(el("div","note",n)); }); }
       if(e.source_lsas.length){
-        side.appendChild(el("h4",null,"Source LSAs"));
+        if(r.observed_by && r.observed_by.length > 1){
+        side.appendChild(el("div","note",
+          "Held by " + r.observed_by.length + " observers: " + r.observed_by.join(", ") +
+          " — one LSA, shown once."));
+      }
+      side.appendChild(el("h4",null,"Source LSAs"));
         e.source_lsas.forEach(function(l){
           side.appendChild(el("div","lsa",
             "Type "+l.lsa_type+" · area "+l.area+" · LSID "+l.link_state_id+

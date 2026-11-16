@@ -383,8 +383,22 @@ def test_connected_routes_are_not_counted_as_learned() -> None:
 
 
 def test_correlation_reports_cdp_state_without_merging() -> None:
+    """A transit network between uncollected routers produces no correlation.
+
+    Correlation pairs a transit network with the *devices* that sit on it. In
+    this run only R2 was collected, so although the LSDB names all five routers,
+    four of them have no device behind them and there is no pair to classify.
+    The five transit networks are still reconstructed — this is silence about
+    correlation, not a loss of OSPF evidence.
+
+    (This is also the regression guard for the opposite bug: when every router-id
+    in a flooded LSDB was credited to the collected device, this test produced
+    ten bogus correlations between devices that were never contacted.)
+    """
     result = _run(ospf=True)
     ospf = result.ospf_topology
-    # Correlations are produced for OSPF relationships between collected devices;
-    # in this single-device run there are none, and that must be silent, not an error.
+
+    assert len(ospf.transit_networks) == 5
     assert ospf.correlations == []
+    # ...and correlating must never conjure a cable.
+    assert result.topology.links == []

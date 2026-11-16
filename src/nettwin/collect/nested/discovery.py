@@ -26,6 +26,7 @@ as a node with ``status="unreachable"`` and a reason.
 
 from __future__ import annotations
 
+import inspect
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -667,23 +668,42 @@ class RecursiveDiscovery:
             status="ok",
         )
         parsed: dict[str, object] = {}
+
+        # Identity first. Several parsers are observer-scoped — every OSPF row
+        # carries the id of the device whose CLI produced it — so the device id
+        # has to exist *before* they run. Parsing ``show version`` up front also
+        # keeps the ordering honest: no parser sees a blank device id and gets
+        # patched up afterwards.
+        version_text = collected.get("show version", "")
+        if version_text:
+            version, warns = parsers.parse_show_version(version_text)
+            parsed["show version"] = version
+            observations.warnings.extend(warns)
+            if isinstance(version, parsers.ParsedVersion):
+                observations.identity = {
+                    "hostname": version.hostname,
+                    "ios_version": version.ios_version,
+                    "model": version.model,
+                }
+                if version.hostname:
+                    observations.device_id = version.hostname.lower()
+
+        device_id = observations.device_id or ""
         for command, text in collected.items():
+            if command == "show version":
+                continue
             parser = _PARSERS.get(command)
             if parser is None:
                 continue
-            value, warns = parser(text)  # type: ignore[operator]
+            # Observer-scoped parsers take the device id; the rest do not.
+            # ``_DEVICE_SCOPED_COMMANDS`` is derived from the parser signatures,
+            # so a parser can never silently lose its attribution again.
+            if command in _DEVICE_SCOPED_COMMANDS:
+                value, warns = parser(text, device_id)  # type: ignore[operator]
+            else:
+                value, warns = parser(text)  # type: ignore[operator]
             parsed[command] = value
             observations.warnings.extend(warns)
-
-        version = parsed.get("show version")
-        if isinstance(version, parsers.ParsedVersion):
-            observations.identity = {
-                "hostname": version.hostname,
-                "ios_version": version.ios_version,
-                "model": version.model,
-            }
-            if version.hostname:
-                observations.device_id = version.hostname.lower()
 
         brief = parsed.get("show ip interface brief")
         if isinstance(brief, list):
@@ -772,24 +792,29 @@ def ospf_device_data(observations: DeviceObservations, device_id: str):
         process_id=context.get("process_id", ""),
         router_id=context.get("router_id", ""),
     )
-    data.neighbors = [
-        OspfNeighbor.model_validate(row) for row in observations.ospf_neighbors
-    ]
-    data.interfaces = [
-        OspfInterface.model_validate(row) for row in observations.ospf_interfaces
-    ]
-    data.database_summary = [
-        OspfLsaSummary.model_validate(row) for row in observations.ospf_database
-    ]
-    data.router_lsas = [
-        OspfRouterLsa.model_validate(row) for row in observations.ospf_router_lsas
-    ]
-    data.network_lsas = [
-        OspfNetworkLsa.model_validate(row) for row in observations.ospf_network_lsas
-    ]
-    data.routes = [
-        OspfRoute.model_validate(row) for row in observations.ospf_routes
-    ]
+
+    def _attributed(model, rows):  # noqa: ANN001, ANN202 - tiny local helper
+        """Validate rows, filling in the observer where the record lacks one.
+
+        Every object below is evidence *this device observed*; the device id is
+        therefore the observing device, and it is filled in here rather than
+        trusted to have survived serialization. An Advertising Router is a
+        different field and is never touched.
+        """
+        out = []
+        for row in rows:
+            item = model.model_validate(row)
+            if not item.device_id:
+                item.device_id = device_id
+            out.append(item)
+        return out
+
+    data.neighbors = _attributed(OspfNeighbor, observations.ospf_neighbors)
+    data.interfaces = _attributed(OspfInterface, observations.ospf_interfaces)
+    data.database_summary = _attributed(OspfLsaSummary, observations.ospf_database)
+    data.router_lsas = _attributed(OspfRouterLsa, observations.ospf_router_lsas)
+    data.network_lsas = _attributed(OspfNetworkLsa, observations.ospf_network_lsas)
+    data.routes = _attributed(OspfRoute, observations.ospf_routes)
     return data
 
 
@@ -829,7 +854,13 @@ def _attach_ospf(
 
     summary = parsed.get("show ip ospf database")
     if isinstance(summary, list):
-        observations.ospf_database = [item.model_dump() for item in summary]
+        # The LSDB summary is observer-scoped: every row came from this device's
+        # database even though the Advertising Router is somebody else.
+        observer = observations.device_id or host or ""
+        observations.ospf_database = [
+            {**item.model_dump(), "device_id": item.device_id or observer}
+            for item in summary
+        ]
 
     router_lsas = parsed.get("show ip ospf database router")
     if isinstance(router_lsas, list):
@@ -875,6 +906,15 @@ _PARSERS = {
     "show ip ospf database network": ospf_parsers.parse_show_ip_ospf_database_network,
     "show ip ospf route": ospf_parsers.parse_show_ip_ospf_route,
 }
+
+
+#: Commands whose parser is observer-scoped, derived from the signatures so
+#: adding a ``device_id`` parameter to a parser is enough to have it attributed.
+_DEVICE_SCOPED_COMMANDS: frozenset[str] = frozenset(
+    command
+    for command, parser in _PARSERS.items()
+    if "device_id" in inspect.signature(parser).parameters
+)
 
 
 def _status_for_kind(kind: str) -> DeviceStatus:
@@ -997,11 +1037,25 @@ def _assemble_topology(
     ospf_topology = build_ospf_topology(ospf_devices, physical=connected)
     result.ospf_topology = ospf_topology
     if ospf_topology.transit_networks or ospf_topology.router_lsas:
+        # Canonical counts, with the observer multiplicity stated separately.
+        # An LSA held by five routers is one LSA and five observations; printing
+        # the raw record count here is what produced the misleading
+        # "25 transit networks" line.
+        counts = ospf_topology.lsa_counts()
+        observations_note = ""
+        if counts["observers"] > 1:
+            observations_note = (
+                f" (each seen by up to {counts['observers']} observer(s): "
+                f"{counts['router_lsa_observations']} Router LSA and "
+                f"{counts['network_lsa_observations']} Network LSA observations "
+                "collapsed to one copy each)"
+            )
         warnings.append(
-            f"ospf: {len(ospf_topology.router_lsas)} Router LSA(s), "
-            f"{len(ospf_topology.network_lsas)} Network LSA(s), "
-            f"{len(ospf_topology.transit_networks)} transit network(s), "
-            f"{len(ospf_topology.stub_networks)} stub network(s) reconstructed"
+            f"ospf: {counts['router_lsas']} unique Router LSA(s), "
+            f"{counts['network_lsas']} unique Network LSA(s), "
+            f"{counts['transit_networks']} transit network(s), "
+            f"{counts['stub_networks']} stub network(s) reconstructed"
+            f"{observations_note}"
         )
     else:
         warnings.append(

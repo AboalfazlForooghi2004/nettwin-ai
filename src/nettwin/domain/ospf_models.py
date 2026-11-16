@@ -112,6 +112,9 @@ class OspfLsaSummary(BaseModel):
     sequence: str = ""
     checksum: str = ""
     link_count: int | None = None
+    device_id: str = ""
+    """The device whose LSDB this row was read from — an *observer*, not the
+    originator. Defaulted so existing consumers keep working."""
 
 
 class OspfLsaLink(BaseModel):
@@ -154,6 +157,14 @@ class OspfRouterLsa(BaseModel):
     links: list[OspfLsaLink] = Field(default_factory=list)
     device_id: str = ""
     command: str = ""
+    observed_by: list[str] = Field(default_factory=list)
+    """Every device whose LSDB contained this LSA.
+
+    An OSPF LSDB is flooded, so in a five-router area all five routers hold all
+    five Router LSAs. ``device_id`` is the observer that supplied *this* copy;
+    ``observed_by`` is the full set, which is what stops five observers from
+    looking like five distinct LSAs without throwing the provenance away.
+    """
 
 
 class OspfNetworkLsa(BaseModel):
@@ -172,6 +183,8 @@ class OspfNetworkLsa(BaseModel):
     age: int | None = None
     device_id: str = ""
     command: str = ""
+    observed_by: list[str] = Field(default_factory=list)
+    """Every device whose LSDB contained this LSA (see ``OspfRouterLsa``)."""
 
     @property
     def prefix(self) -> str | None:
@@ -412,6 +425,36 @@ class OspfTopology(BaseModel):
         for item in [*self.transit_networks, *self.logical_edges]:
             counts[str(item.state)] = counts.get(str(item.state), 0) + 1
         return counts
+
+    def lsa_counts(self) -> dict[str, int]:
+        """Canonical LSA counts, plus how many observers saw each one.
+
+        ``observed`` is deliberately *not* the length of a list: an LSA seen by
+        five routers is one LSA and five observations, and conflating those two
+        numbers is what made a five-router run report 25 transit networks.
+        """
+        router_observations = sum(
+            len(lsa.observed_by) or 1 for lsa in self.router_lsas
+        )
+        network_observations = sum(
+            len(lsa.observed_by) or 1 for lsa in self.network_lsas
+        )
+        return {
+            "router_lsas": len(self.router_lsas),
+            "network_lsas": len(self.network_lsas),
+            "router_lsa_observations": router_observations,
+            "network_lsa_observations": network_observations,
+            "observers": len(
+                {
+                    observer
+                    for lsa in [*self.router_lsas, *self.network_lsas]
+                    for observer in lsa.observed_by
+                }
+            ),
+            "transit_networks": len(self.transit_networks),
+            "stub_networks": len(self.stub_networks),
+            "logical_edges": len(self.logical_edges),
+        }
 
     def learned_routes(self, device_id: str | None = None) -> list[OspfRoute]:
         """Only the OSPF-*learned* routes — ``Connected`` rows excluded."""
