@@ -6,7 +6,7 @@
 
 | Check | Result |
 |---|---|
-| `python -m pytest` | **313 passed** (274 + 39 new) |
+| `python -m pytest` | **331 passed** (274 + 39 recursive + 18 transport) |
 | `python -m ruff check .` | **All checks passed!** |
 | `python scripts/lab_demo.py --no-llm` | **deterministic: PASS / llm loop: PASS** |
 | Domain schema / engine / graph / simulation | **0 files changed** |
@@ -149,6 +149,52 @@ warnings   : 1
 4. **FQDN vs hostname duplication.** `R2-1` and `R2-1.nettwin.lab` became two
    nodes. Identity now resolves through the Phase-2.2 alias index.
 
+## Post-run fix: `SSHChannel` has no `settimeout` (live bug)
+
+The first **real** run on the Ubuntu host died before the first command:
+
+```
+AttributeError: 'SSHChannel' object has no attribute 'settimeout'
+```
+
+**Cause.** `NetmikoChannelTransport` reached for `connection.channel`. That
+attribute does not exist on `netmiko.BaseConnection` — checked against the
+installed versions (netmiko **4.8.0**, paramiko **4.0.0**):
+
+```python
+assert not hasattr(netmiko.BaseConnection, "channel")   # passes
+```
+
+The SSH channel on a netmiko connection is `connection.remote_conn`
+(`Union[None, Telnet, paramiko.Channel, serial.Serial]`). Where the attribute
+lookup fell through to some other wrapper, `settimeout` was never there — and
+because the failure happened while *opening* the transport, it surfaced before
+the connection stage could even report success.
+
+**Fix.** The transport no longer guesses. It probes, and picks one of two
+explicit backends:
+
+| Probe | `backend` | Read / write |
+|---|---|---|
+| `remote_conn` has `recv` + (`sendall` or `send`) + `settimeout` | `"raw"` | `settimeout(min(timeout, read_timeout))`, `recv()`, `send()` |
+| connection has `read_channel` + `write_channel` | `"api"` | netmiko's own buffered API |
+| neither | — | `TypeError` naming both options |
+
+Timeout behaviour is preserved on both paths: `"raw"` applies the socket
+timeout itself, `"api"` relies on netmiko's non-blocking buffered reads, and
+in both cases `SessionLimits.connect_timeout` still bounds `ConnectHandler`
+and `command_timeout` still bounds per-command polling.
+
+**Regression coverage.** `tests/test_netmiko_transport.py` (18 tests) covers
+the raw backend, the api backend, `remote_conn=None`, a wrapper that lacks
+`settimeout`, credentials redaction, and an end-to-end session that must reach
+`show cdp neighbors detail` output. One test asserts the original mistake
+stays caught:
+
+```python
+assert not hasattr(BaseConnection, "channel")
+```
+
 ## Limitations
 
 1. **No live lab validation.** The acceptance criterion
@@ -171,11 +217,19 @@ warnings   : 1
 
 | Requirement | Status |
 |---|---|
-| Automated tests (39 new, 313 total) | ✅ complete |
+| Automated tests (57 new, 331 total) | ✅ complete |
 | CLI requiring only the seed | ✅ complete |
 | Duplicate prevention / cycle detection | ✅ tested |
 | Limits + explicit failure statuses | ✅ tested |
+| Transport `settimeout` crash (live bug) | ✅ **fixed, mocked regression added** |
 | **Live `Ubuntu → R2-1 → R2-2 → R2-4`** | ❌ **not run — operator step** |
+
+> The transport fix is verified against the **installed** netmiko/paramiko
+> APIs and by 18 mocked tests, but that is still not a live run. Until the
+> command below completes on the Ubuntu host, the connection stage and the
+> first `show cdp neighbors detail` remain unproven on real devices. If it
+> fails again, the exception is no longer swallowed: send the traceback and
+> the transcript in `collected/recursive/`.
 
 To close the acceptance gap, from the Ubuntu workstation:
 
