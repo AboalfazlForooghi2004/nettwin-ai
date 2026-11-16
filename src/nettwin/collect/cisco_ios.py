@@ -55,6 +55,14 @@ READ_ONLY_COMMANDS: frozenset[str] = frozenset(
         # recursive discovery needs to open the nested SSH session. Read-only,
         # like every other entry — no configuration, no state change.
         "show cdp neighbors detail",
+        # Phase 2.6: OSPF operational state and LSDB. All read-only `show`
+        # commands; `show ip ospf interface` (which can print authentication
+        # material) is deliberately NOT here.
+        "show ip ospf interface brief",
+        "show ip ospf database",
+        "show ip ospf database router",
+        "show ip ospf database network",
+        "show ip ospf route",
     }
 )
 
@@ -68,6 +76,27 @@ DEFAULT_COMMANDS: tuple[str, ...] = (
     "show ip ospf neighbor",
     "show cdp neighbors",
     "show cdp neighbors detail",
+    # Phase 2.6 — appended, so the phase-2 order is unchanged.
+    "show ip ospf interface brief",
+    "show ip ospf database",
+    "show ip ospf database router",
+    "show ip ospf database network",
+    "show ip ospf route",
+)
+
+#: Commands whose failure must never cost us the rest of a device's evidence.
+#: A router with no OSPF configured answers these with an error, a timeout, or
+#: nothing at all — that is a normal, expected condition, not a collection
+#: failure. Phase-2 CDP/interface/route evidence is gathered either way.
+OPTIONAL_COMMANDS: frozenset[str] = frozenset(
+    {
+        "show ip ospf neighbor",
+        "show ip ospf interface brief",
+        "show ip ospf database",
+        "show ip ospf database router",
+        "show ip ospf database network",
+        "show ip ospf route",
+    }
 )
 
 # Second hard layer: fragments that must never appear in any dispatched
@@ -248,6 +277,15 @@ class DeviceObservations:
     #: Phase 2.3: ``show cdp neighbors detail`` blocks — the only place a
     #: neighbour's management IP appears. Empty for a Phase-2 style run.
     cdp_neighbors_detail: list[dict[str, Any]] = field(default_factory=list)
+    #: Phase 2.6 — OSPF operational state and LSDB. Kept flat and
+    #: JSON-serializable like every other observation so a run stays replayable.
+    ospf_interfaces: list[dict[str, Any]] = field(default_factory=list)
+    ospf_database: list[dict[str, Any]] = field(default_factory=list)
+    ospf_router_lsas: list[dict[str, Any]] = field(default_factory=list)
+    ospf_network_lsas: list[dict[str, Any]] = field(default_factory=list)
+    ospf_routes: list[dict[str, Any]] = field(default_factory=list)
+    #: ``(process_id, router_id)`` from the OSPF output header.
+    ospf_context: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -443,13 +481,45 @@ class CiscoIOSCollector:
 
     @staticmethod
     def _overall_status(observations: DeviceObservations) -> str:
+        """Overall device status.
+
+        A failed *optional* command (see :data:`OPTIONAL_COMMANDS`) does not
+        make a device partial: a router with no OSPF configured answers those
+        with an error, and its CDP/interface/route evidence is still complete.
+        Those failures are recorded as warnings instead, so the reason is never
+        hidden — only the status stays ``ok``.
+        """
         if not observations.commands:
             return "failed"
-        ok_count = sum(1 for c in observations.commands if c.status == "ok")
-        if ok_count == len(observations.commands):
+        required = [c for c in observations.commands if c.command not in OPTIONAL_COMMANDS]
+        optional = [c for c in observations.commands if c.command in OPTIONAL_COMMANDS]
+        ok_required = sum(1 for c in required if c.status == "ok")
+        ok_optional = sum(1 for c in optional if c.status == "ok")
+        if not required:
+            return "partial" if ok_optional else "failed"
+        if ok_required == len(required) and ok_optional == len(optional):
             parser_failed = any("parser failed" in w for w in observations.warnings)
             return "partial" if parser_failed else "ok"
-        return "partial" if ok_count else "failed"
+        if ok_required == len(required):
+            # Every required section succeeded. Optional sections may be absent
+            # for two very different reasons, and they are not the same thing:
+            #
+            #   * an *error* — the device ran the command and declined it. On a
+            #     router with no OSPF configured that is the expected answer, so
+            #     it is a warning and the device stays "ok".
+            #   * a *timeout* — the device went quiet mid-collection. That is a
+            #     genuine anomaly worth flagging, so the device stays "partial".
+            for command in optional:
+                if command.status == "ok":
+                    continue
+                observations.warnings.append(
+                    f"{command.command}: optional section unavailable "
+                    f"({command.status}) — device evidence is otherwise complete"
+                )
+                if command.status == "timeout":
+                    return "partial"
+            return "ok"
+        return "partial" if ok_required else "failed"
 
 
 # --------------------------------------------------------------------------- #

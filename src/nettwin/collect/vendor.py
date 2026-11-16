@@ -43,6 +43,13 @@ CISCO_IOS_COMMANDS: tuple[str, ...] = (
     "show ip ospf neighbor",
     "show cdp neighbors",
     "show cdp neighbors detail",
+    # Phase 2.6 — OSPF state and LSDB. All read-only `show`; the per-vendor
+    # optional set below marks them so a non-OSPF router is not penalised.
+    "show ip ospf interface brief",
+    "show ip ospf database",
+    "show ip ospf database router",
+    "show ip ospf database network",
+    "show ip ospf route",
 )
 
 # --------------------------------------------------------------------------- #
@@ -106,11 +113,23 @@ class VendorProfile:
         return self.key in {CISCO_IOS_VENDOR, FORTIGATE_VENDOR}
 
 
+CISCO_IOS_OPTIONAL_COMMANDS: frozenset[str] = frozenset(
+    {
+        "show ip ospf neighbor",
+        "show ip ospf interface brief",
+        "show ip ospf database",
+        "show ip ospf database router",
+        "show ip ospf database network",
+        "show ip ospf route",
+    }
+)
+
 CISCO_IOS_PROFILE = VendorProfile(
     key=CISCO_IOS_VENDOR,
     label="Cisco IOS / IOS-XE",
     commands=CISCO_IOS_COMMANDS,
     identity_command="show version",
+    optional_commands=CISCO_IOS_OPTIONAL_COMMANDS,
 )
 
 FORTIGATE_PROFILE = VendorProfile(

@@ -49,7 +49,27 @@ def full_outputs() -> dict[str, str]:
         "show ip ospf neighbor": _read("show_ip_ospf_neighbor.txt"),
         "show cdp neighbors": _read("show_cdp_neighbors.txt"),
         "show cdp neighbors detail": _read("show_cdp_neighbors_detail.txt"),
+        # Phase 2.6 — real lab OSPF output (see tests/data/ospf/).
+        **_ospf_outputs(),
     }
+
+
+OSPF_DATA = Path(__file__).parent / "data" / "ospf"
+
+
+def _ospf_outputs() -> dict[str, str]:
+    """The real OSPF lab outputs (Phase 2.6), keyed by command."""
+    return {
+        "show ip ospf interface brief": _ospf("r2_show_ip_ospf_interface_brief.txt"),
+        "show ip ospf database": _ospf("r2_show_ip_ospf_database.txt"),
+        "show ip ospf database router": _ospf("r2_show_ip_ospf_database_router.txt"),
+        "show ip ospf database network": _ospf("r2_show_ip_ospf_database_network.txt"),
+        "show ip ospf route": _ospf("r2_show_ip_ospf_route.txt"),
+    }
+
+
+def _ospf(name: str) -> str:
+    return (OSPF_DATA / name).read_text(encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -124,9 +144,16 @@ PHASE2_ALLOWLIST = frozenset(
 )
 
 
-def test_readonly_allowlist_is_exactly_six_show_commands() -> None:
+def test_readonly_allowlist_is_exactly_the_known_show_commands() -> None:
+    """The allowlist is pinned exactly — adding a command must be deliberate.
+
+    Phase 2.6 appended six OSPF `show` commands. The set is still enumerated
+    literally so an accidental addition fails here rather than reaching a
+    device.
+    """
     assert READ_ONLY_COMMANDS == frozenset(
         {
+            # Phase 2 — the original five.
             "show version",
             "show ip interface brief",
             "show ip route",
@@ -134,15 +161,45 @@ def test_readonly_allowlist_is_exactly_six_show_commands() -> None:
             "show cdp neighbors",
             # Phase 2.3 — the only source of a neighbour's management IP.
             "show cdp neighbors detail",
+            # Phase 2.6 — OSPF operational state and LSDB.
+            "show ip ospf interface brief",
+            "show ip ospf database",
+            "show ip ospf database router",
+            "show ip ospf database network",
+            "show ip ospf route",
         }
     )
     assert set(DEFAULT_COMMANDS) == set(READ_ONLY_COMMANDS)
 
 
+def test_ospf_commands_are_optional_and_never_include_auth_material() -> None:
+    """The OSPF additions must be optional, read-only, and auth-free."""
+    from nettwin.collect.cisco_ios import OPTIONAL_COMMANDS
+
+    assert OPTIONAL_COMMANDS <= READ_ONLY_COMMANDS
+    for command in OPTIONAL_COMMANDS:
+        assert command.startswith("show ip ospf "), command
+    # `show ip ospf interface` (without "brief") can print authentication
+    # configuration, so it must never be collectable.
+    assert "show ip ospf interface" not in READ_ONLY_COMMANDS
+    assert "show running-config" not in READ_ONLY_COMMANDS
+    for command in READ_ONLY_COMMANDS:
+        for needle in ("key", "password", "auth"):
+            assert needle not in command
+
+
 def test_allowlist_grew_only_by_readonly_show_commands() -> None:
     """Adding a command must never introduce anything that changes state."""
     added = READ_ONLY_COMMANDS - PHASE2_ALLOWLIST
-    assert added == {"show cdp neighbors detail"}, added
+    assert added == {
+        "show cdp neighbors detail",     # Phase 2.3
+        # Phase 2.6
+        "show ip ospf interface brief",
+        "show ip ospf database",
+        "show ip ospf database router",
+        "show ip ospf database network",
+        "show ip ospf route",
+    }, added
     for command in READ_ONLY_COMMANDS:
         assert command.startswith("show "), f"non-'show' command in allowlist: {command!r}"
     for command in added:
@@ -209,7 +266,10 @@ def test_session_disconnected_after_successful_collection(full_outputs: dict[str
     observations = collector.collect()
     assert session.disconnected is True
     assert observations.status == "ok"
-    assert len(observations.commands) == len(DEFAULT_COMMANDS) == 6
+    # Every allowlisted command ran exactly once; the count is asserted
+    # against the real set rather than a frozen magic number.
+    assert len(observations.commands) == len(DEFAULT_COMMANDS)
+    assert {c.command for c in observations.commands} == set(DEFAULT_COMMANDS)
     assert all(c.status == "ok" for c in observations.commands)
 
 
@@ -609,6 +669,7 @@ def live_outputs() -> dict[str, str]:
         "show ip ospf neighbor": _live("show_ip_ospf_neighbor.txt"),
         "show cdp neighbors": _live("show_cdp_neighbors.txt"),
         "show cdp neighbors detail": _live("show_cdp_neighbors_detail.txt"),
+        **_ospf_outputs(),
     }
 
 

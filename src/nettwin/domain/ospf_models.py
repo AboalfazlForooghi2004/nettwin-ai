@@ -1,0 +1,430 @@
+"""Normalized OSPF domain models (Phase 2.6).
+
+Deliberately a **separate namespace** from :mod:`nettwin.domain.models`. OSPF
+produces a logical, SPF-derived view of the network; the physical view in
+``domain.models`` is built from layer-2 neighbour evidence. Keeping them in
+separate types is what stops an OSPF adjacency from silently becoming a cable.
+
+Design rules applied here:
+
+* No hardcoded process id, area id or router count — everything is carried per
+  object, so a 2-process, 3-area device works exactly like the single-process
+  lab.
+* Every reconstructed relationship keeps ``source_lsas``: the LSAs it was
+  derived from, with area / advertising router / LSID / sequence / checksum.
+  Nothing is asserted without a traceable origin.
+* ``OspfEvidenceState`` is mandatory on every derived relationship, so
+  "confirmed" is a claim the model makes explicitly rather than a default.
+"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class OspfEvidenceState(StrEnum):
+    """How well the reconstructed relationship is evidenced."""
+
+    CONFIRMED = "confirmed"
+    """Type 1 and Type 2 evidence agree (or reciprocal P2P evidence)."""
+
+    PARTIAL = "partial"
+    """Only one relevant evidence source is available."""
+
+    INCONSISTENT = "inconsistent"
+    """Type 1 and Type 2 evidence conflict. Never silently resolved."""
+
+    UNRESOLVED = "unresolved"
+    """Router ID / interface / prefix association cannot be determined."""
+
+
+class OspfLinkType(StrEnum):
+    """Router LSA (Type 1) link types."""
+
+    POINT_TO_POINT = "point-to-point"
+    TRANSIT = "transit"
+    STUB = "stub"
+    VIRTUAL = "virtual"
+    UNKNOWN = "unknown"
+
+
+class OspfRouteType(StrEnum):
+    """``show ip ospf route`` type column, normalized."""
+
+    CONNECTED = "connected"
+    INTRA_AREA = "intra-area"
+    INTER_AREA = "inter-area"
+    EXTERNAL_1 = "external-1"
+    EXTERNAL_2 = "external-2"
+    NSSA_1 = "nssa-1"
+    NSSA_2 = "nssa-2"
+    UNKNOWN = "unknown"
+
+
+class OspfCdpRelation(StrEnum):
+    """How one OSPF logical relationship lines up with CDP evidence."""
+
+    CDP_CONFIRMED = "cdp_confirmed"
+    CDP_MISSING = "cdp_missing"
+    CDP_DISAGREES = "cdp_disagrees"
+    NO_CDP_DATA = "no_cdp_data"
+
+
+# --------------------------------------------------------------------------- #
+# LSA references — the provenance anchor for everything below
+# --------------------------------------------------------------------------- #
+
+
+class OspfLsaRef(BaseModel):
+    """A pointer to one LSA in one device's LSDB."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    device_id: str = Field(min_length=1)
+    area: str = Field(min_length=1)
+    lsa_type: int = Field(ge=1, le=11)
+    link_state_id: str = Field(min_length=1)
+    advertising_router: str = Field(min_length=1)
+    sequence: str = ""
+    checksum: str = ""
+    age: int | None = None
+    command: str = ""
+    """The CLI command this came from, so the evidence is traceable."""
+
+
+# --------------------------------------------------------------------------- #
+# Raw LSDB records
+# --------------------------------------------------------------------------- #
+
+
+class OspfLsaSummary(BaseModel):
+    """One row of ``show ip ospf database``."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    area: str
+    lsa_type: int
+    link_state_id: str
+    advertising_router: str
+    age: int | None = None
+    sequence: str = ""
+    checksum: str = ""
+    link_count: int | None = None
+
+
+class OspfLsaLink(BaseModel):
+    """One link record inside a Router LSA."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    link_type: OspfLinkType
+    link_id: str = ""
+    link_data: str = ""
+    network_mask: str = ""
+    metric: int | None = None
+    mtid: str = ""
+
+    @property
+    def prefix(self) -> str | None:
+        """``link_id/mask`` for a stub link, when both parts exist."""
+        if self.link_type is not OspfLinkType.STUB or not self.link_id or not self.network_mask:
+            return None
+        try:
+            import ipaddress
+
+            return str(ipaddress.ip_network(f"{self.link_id}/{self.network_mask}", strict=False))
+        except ValueError:
+            return None
+
+
+class OspfRouterLsa(BaseModel):
+    """A Router LSA (Type 1) with its parsed links."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    area: str
+    link_state_id: str
+    advertising_router: str
+    sequence: str = ""
+    checksum: str = ""
+    age: int | None = None
+    number_of_links: int | None = None
+    links: list[OspfLsaLink] = Field(default_factory=list)
+    device_id: str = ""
+    command: str = ""
+
+
+class OspfNetworkLsa(BaseModel):
+    """A Network LSA (Type 2) — a transit network's DR view."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    area: str
+    link_state_id: str
+    """The Designated Router's interface address on this segment."""
+    advertising_router: str
+    network_mask: str = ""
+    attached_routers: list[str] = Field(default_factory=list)
+    sequence: str = ""
+    checksum: str = ""
+    age: int | None = None
+    device_id: str = ""
+    command: str = ""
+
+    @property
+    def prefix(self) -> str | None:
+        """Network prefix from the DR address and the LSA's mask, if both exist."""
+        if not self.link_state_id or not self.network_mask:
+            return None
+        try:
+            import ipaddress
+
+            network = ipaddress.ip_network(
+                f"{self.link_state_id}/{self.network_mask}", strict=False
+            )
+            return str(network)
+        except ValueError:
+            return None
+
+
+# --------------------------------------------------------------------------- #
+# Device-level operational state
+# --------------------------------------------------------------------------- #
+
+
+class OspfNeighbor(BaseModel):
+    """One row of ``show ip ospf neighbor``."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    device_id: str
+    local_interface: str
+    neighbor_router_id: str
+    neighbor_address: str
+    state: str
+    """Raw state as printed, e.g. ``FULL/BDR``."""
+    priority: str = ""
+    dead_time: str = ""
+    area: str = ""
+    process_id: str = ""
+    evidence: str = "ospf-neighbor"
+
+    @property
+    def adjacency_state(self) -> str:
+        """The adjacency half of ``FULL/BDR``."""
+        return self.state.split("/")[0].strip().upper()
+
+    @property
+    def role(self) -> str:
+        """The DR/BDR role half, or empty when IOS printed none."""
+        parts = self.state.split("/")
+        return parts[1].strip() if len(parts) > 1 else ""
+
+
+class OspfInterface(BaseModel):
+    """One row of ``show ip ospf interface brief``."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    device_id: str
+    name: str
+    process_id: str = ""
+    area: str = ""
+    ip_address: str = ""
+    mask: str = ""
+    cost: int | None = None
+    state: str = ""
+    neighbors_full: int | None = None
+    neighbors_total: int | None = None
+
+    @property
+    def prefix(self) -> str | None:
+        if not self.ip_address or not self.mask:
+            return None
+        try:
+            import ipaddress
+
+            return str(
+                ipaddress.ip_network(f"{self.ip_address}/{self.mask}", strict=False)
+            )
+        except ValueError:
+            return None
+
+
+class OspfArea(BaseModel):
+    """One area on one device."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    area: str
+    interfaces: list[str] = Field(default_factory=list)
+
+
+class OspfInstance(BaseModel):
+    """One OSPF process on one device."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    device_id: str
+    process_id: str
+    router_id: str = ""
+    vrf: str = "default"
+    protocol_version: int = 2
+    areas: list[OspfArea] = Field(default_factory=list)
+
+
+class OspfRoute(BaseModel):
+    """One row of ``show ip ospf route``.
+
+    ``connected`` rows are the device's *own* interface networks. They are OSPF
+    state, but they are not OSPF-*learned*: the flag exists so they can never be
+    counted as learned routes.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    device_id: str
+    prefix: str
+    route_type: OspfRouteType
+    cost: int | None = None
+    next_hop: str | None = None
+    outgoing_interface: str = ""
+    area: str = ""
+    learned: bool = True
+    raw_type: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# Reconstructed logical topology
+# --------------------------------------------------------------------------- #
+
+
+class OspfTransitNetwork(BaseModel):
+    """A transit network (a Type-2-evidenced multi-access segment).
+
+    This is a **first-class node**, not an edge. Three routers on one LAN
+    produce one of these with three members — never three point-to-point links.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    id: str
+    area: str
+    prefix: str | None = None
+    dr_address: str
+    advertising_router: str
+    member_router_ids: list[str] = Field(default_factory=list)
+    #: router_id -> its interface address on this segment, where resolvable.
+    member_interface_addresses: dict[str, str] = Field(default_factory=dict)
+    source_lsas: list[OspfLsaRef] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    state: OspfEvidenceState = OspfEvidenceState.PARTIAL
+    notes: list[str] = Field(default_factory=list)
+
+
+class OspfStubNetwork(BaseModel):
+    """A stub network: a prefix advertised by a router. Never a node or an edge."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    prefix: str
+    advertising_router: str
+    area: str
+    metric: int | None = None
+    source_lsa: OspfLsaRef | None = None
+    device_id: str = ""
+
+
+class OspfLogicalEdge(BaseModel):
+    """A router-to-router logical adjacency, only where genuinely evidenced.
+
+    Used for point-to-point segments with reciprocal Type-1 evidence. It is a
+    *logical* edge: it is not a :class:`nettwin.domain.models.Link` and is never
+    added to ``Topology.links``.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    source_router_id: str
+    destination_router_id: str
+    prefix: str | None = None
+    area: str
+    source_interface: str = ""
+    destination_interface: str = ""
+    source_lsas: list[OspfLsaRef] = Field(default_factory=list)
+    state: OspfEvidenceState = OspfEvidenceState.PARTIAL
+    notes: list[str] = Field(default_factory=list)
+
+
+class OspfRouter(BaseModel):
+    """One OSPF router, keyed by Router ID (which is stable and device-independent)."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    router_id: str
+    device_id: str = ""
+    """Set only when a collected device is proven to own this Router ID."""
+    process_ids: list[str] = Field(default_factory=list)
+    areas: list[str] = Field(default_factory=list)
+    collected: bool = False
+    """False when the router appears only in the LSDB of others."""
+
+
+class OspfCorrelation(BaseModel):
+    """The CDP-vs-OSPF comparison for one logical relationship."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    relation_id: str
+    cdp_state: OspfCdpRelation
+    detail: str = ""
+
+
+class OspfTopology(BaseModel):
+    """Everything OSPF taught us, kept apart from the physical topology."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    instances: list[OspfInstance] = Field(default_factory=list)
+    routers: list[OspfRouter] = Field(default_factory=list)
+    neighbors: list[OspfNeighbor] = Field(default_factory=list)
+    interfaces: list[OspfInterface] = Field(default_factory=list)
+    database_summary: list[OspfLsaSummary] = Field(default_factory=list)
+    router_lsas: list[OspfRouterLsa] = Field(default_factory=list)
+    network_lsas: list[OspfNetworkLsa] = Field(default_factory=list)
+    transit_networks: list[OspfTransitNetwork] = Field(default_factory=list)
+    stub_networks: list[OspfStubNetwork] = Field(default_factory=list)
+    logical_edges: list[OspfLogicalEdge] = Field(default_factory=list)
+    routes: list[OspfRoute] = Field(default_factory=list)
+    correlations: list[OspfCorrelation] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    # -- convenience ------------------------------------------------------- #
+
+    def router_ids(self) -> list[str]:
+        return sorted({r.router_id for r in self.routers})
+
+    def state_counts(self) -> dict[str, int]:
+        """How many reconstructed relationships sit in each evidence state."""
+        counts: dict[str, int] = {}
+        for item in [*self.transit_networks, *self.logical_edges]:
+            counts[str(item.state)] = counts.get(str(item.state), 0) + 1
+        return counts
+
+    def learned_routes(self, device_id: str | None = None) -> list[OspfRoute]:
+        """Only the OSPF-*learned* routes — ``Connected`` rows excluded."""
+        return [
+            r
+            for r in self.routes
+            if r.learned and (device_id is None or r.device_id == device_id)
+        ]
+
+    def connected_routes(self, device_id: str | None = None) -> list[OspfRoute]:
+        """The device's own interface networks as OSPF reports them."""
+        return [
+            r
+            for r in self.routes
+            if not r.learned and (device_id is None or r.device_id == device_id)
+        ]

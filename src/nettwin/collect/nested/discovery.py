@@ -33,8 +33,10 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from nettwin.collect import ios_parsers as parsers
+from nettwin.collect import ospf_parsers
 from nettwin.collect.cisco_ios import (
     DEFAULT_COMMANDS,
+    OPTIONAL_COMMANDS,
     READ_ONLY_COMMANDS,
     CollectorError,
     DeviceObservations,
@@ -60,6 +62,7 @@ from nettwin.domain.models import Topology
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from nettwin.collect.discovery.links import LinkDiscoveryResult
+    from nettwin.domain.ospf_models import OspfTopology
 
 #: Commands that are safe to run on any device, in discovery order.
 #: ``DEFAULT_COMMANDS`` is the Phase-2 set; the detail command is what carries
@@ -129,6 +132,8 @@ class RecursiveDiscoveryResult:
     topology: Topology | None = None
     #: Phase 2.5: the audit trail behind ``topology.links``.
     link_result: LinkDiscoveryResult | None = None
+    #: Phase 2.6: the OSPF logical view, kept apart from the physical one.
+    ospf_topology: OspfTopology | None = None
     warnings: list[str] = field(default_factory=list)
     visits: int = 0
     ssh_attempts: int = 0
@@ -578,14 +583,33 @@ class RecursiveDiscovery:
         session.open()
         try:
             collected: dict[str, str] = {}
+            optional_failures: list[str] = []
             for command in self._commands:
                 self._observer.command_started(node.identity, command)
-                collected[command] = session.run_command(command)
+                try:
+                    collected[command] = session.run_command(command)
+                except (SessionError, SessionTimeoutError) as exc:
+                    # A command that is *optional* must never cost the device
+                    # its other evidence. OSPF is optional by definition: a
+                    # router with no OSPF configured answers with an error or
+                    # simply nothing. CDP/interface/route evidence is kept and
+                    # the reason is recorded.
+                    if command not in OPTIONAL_COMMANDS:
+                        raise
+                    optional_failures.append(
+                        f"{command}: {failure_summary(str(exc))}"
+                    )
             observations = self._observations_from(node, session, collected)
         except Exception:
             session.close()
             raise
 
+        if optional_failures:
+            for detail in optional_failures:
+                observations.warnings.append(
+                    f"optional command unavailable — {detail} "
+                    "(device evidence is otherwise complete)"
+                )
         node.observations = observations
         node.status = DeviceStatus.COLLECTED
         node.interfaces = [item["name"] for item in observations.interfaces]
@@ -687,6 +711,12 @@ class RecursiveDiscovery:
 
             observations.cdp_neighbors_detail = [asdict(item) for item in detail]
 
+        # --- Phase 2.6: OSPF ------------------------------------------------
+        # Each block is independent: a device where OSPF is not configured
+        # returns an error or empty text for every one of these, which parses
+        # to "nothing" plus a warning and must never affect CDP discovery.
+        _attach_ospf(observations, parsed, node.path[-1], collected)
+
         if not observations.device_id:
             observations.status = "partial"
             observations.warnings.append(
@@ -724,13 +754,126 @@ class RecursiveDiscovery:
 # Helpers
 # --------------------------------------------------------------------------- #
 
+def ospf_device_data(observations: DeviceObservations, device_id: str):
+    """Rebuild typed OSPF objects from one device's stored observations."""
+    from nettwin.collect.ospf_topology import OspfDeviceData
+    from nettwin.domain.ospf_models import (
+        OspfInterface,
+        OspfLsaSummary,
+        OspfNeighbor,
+        OspfNetworkLsa,
+        OspfRoute,
+        OspfRouterLsa,
+    )
+
+    context = observations.ospf_context or {}
+    data = OspfDeviceData(
+        device_id=device_id,
+        process_id=context.get("process_id", ""),
+        router_id=context.get("router_id", ""),
+    )
+    data.neighbors = [
+        OspfNeighbor.model_validate(row) for row in observations.ospf_neighbors
+    ]
+    data.interfaces = [
+        OspfInterface.model_validate(row) for row in observations.ospf_interfaces
+    ]
+    data.database_summary = [
+        OspfLsaSummary.model_validate(row) for row in observations.ospf_database
+    ]
+    data.router_lsas = [
+        OspfRouterLsa.model_validate(row) for row in observations.ospf_router_lsas
+    ]
+    data.network_lsas = [
+        OspfNetworkLsa.model_validate(row) for row in observations.ospf_network_lsas
+    ]
+    data.routes = [
+        OspfRoute.model_validate(row) for row in observations.ospf_routes
+    ]
+    return data
+
+
+def _attach_ospf(
+    observations: DeviceObservations,
+    parsed: dict[str, object],
+    host: str,
+    collected: dict[str, str] | None = None,
+) -> None:
+    """Copy parsed OSPF results onto ``observations``.
+
+    Kept separate from the CDP block on purpose: OSPF is optional evidence, and
+    a device without it must produce identical CDP results to a run that never
+    asked about OSPF at all.
+    """
+    neighbors = parsed.get("show ip ospf neighbor")
+    if isinstance(neighbors, list):
+        observations.ospf_neighbors = [
+            {
+                "device_id": observations.device_id or host,
+                "local_interface": item.interface,
+                "neighbor_router_id": item.neighbor_id,
+                "neighbor_address": item.address,
+                "state": item.state,
+                "priority": item.priority,
+                "dead_time": item.dead_time,
+                "area": "",
+                "process_id": (observations.ospf_context or {}).get("process_id", ""),
+                "evidence": "ospf-neighbor",
+            }
+            for item in neighbors
+        ]
+
+    interfaces = parsed.get("show ip ospf interface brief")
+    if isinstance(interfaces, list):
+        observations.ospf_interfaces = [item.model_dump() for item in interfaces]
+
+    summary = parsed.get("show ip ospf database")
+    if isinstance(summary, list):
+        observations.ospf_database = [item.model_dump() for item in summary]
+
+    router_lsas = parsed.get("show ip ospf database router")
+    if isinstance(router_lsas, list):
+        observations.ospf_router_lsas = [item.model_dump() for item in router_lsas]
+
+    network_lsas = parsed.get("show ip ospf database network")
+    if isinstance(network_lsas, list):
+        observations.ospf_network_lsas = [item.model_dump() for item in network_lsas]
+
+    routes = parsed.get("show ip ospf route")
+    if isinstance(routes, list):
+        observations.ospf_routes = [item.model_dump() for item in routes]
+
+    # Process / router id come from whichever OSPF output printed the header.
+    for key in (
+        "show ip ospf database",
+        "show ip ospf database router",
+        "show ip ospf database network",
+        "show ip ospf route",
+    ):
+        text = (collected or {}).get(key, "")
+        if text and text.strip():
+            process_id, router_id = ospf_parsers.process_context(text)
+            if process_id or router_id:
+                observations.ospf_context = {
+                    "process_id": process_id,
+                    "router_id": router_id,
+                }
+                break
+
+
 _PARSERS = {
     "show version": parsers.parse_show_version,
     "show ip interface brief": parsers.parse_show_ip_interface_brief,
     "show ip route": parsers.parse_show_ip_route,
-    "show ip ospf neighbor": parsers.parse_show_ip_ospf_neighbor,
     "show cdp neighbors": parsers.parse_show_cdp_neighbors,
     "show cdp neighbors detail": parsers.parse_show_cdp_neighbors_detail,
+    # Phase 2.6 — OSPF. Absent OSPF output parses to an empty list + warning.
+    "show ip ospf neighbor": ospf_parsers.parse_show_ip_ospf_neighbor,
+    "show ip ospf interface brief": ospf_parsers.parse_show_ip_ospf_interface_brief,
+    "show ip ospf database": ospf_parsers.parse_show_ip_ospf_database,
+    "show ip ospf database router": ospf_parsers.parse_show_ip_ospf_database_router,
+    "show ip ospf database network": ospf_parsers.parse_show_ip_ospf_database_network,
+    "show ip ospf route": ospf_parsers.parse_show_ip_ospf_route,
 }
 
 
@@ -838,6 +981,35 @@ def _assemble_topology(
         endpoints=topology.endpoints,
         services=topology.services,
     )
+
+    # --- OSPF logical topology (Phase 2.6) ---------------------------------
+    # Built from the same collections but a completely separate model: OSPF
+    # never contributes a ``Link``. Correlated with the CDP result so
+    # disagreement is reported rather than resolved.
+    from nettwin.collect.ospf_topology import build_ospf_topology
+
+    ospf_devices = []
+    for node in result.collected_nodes:
+        if node.observations is None:
+            continue
+        device_id = node.observations.device_id or node.identity
+        ospf_devices.append(ospf_device_data(node.observations, device_id))
+    ospf_topology = build_ospf_topology(ospf_devices, physical=connected)
+    result.ospf_topology = ospf_topology
+    if ospf_topology.transit_networks or ospf_topology.router_lsas:
+        warnings.append(
+            f"ospf: {len(ospf_topology.router_lsas)} Router LSA(s), "
+            f"{len(ospf_topology.network_lsas)} Network LSA(s), "
+            f"{len(ospf_topology.transit_networks)} transit network(s), "
+            f"{len(ospf_topology.stub_networks)} stub network(s) reconstructed"
+        )
+    else:
+        warnings.append(
+            "ospf: no OSPF LSDB evidence collected — no logical topology "
+            "reconstructed (nothing invented)"
+        )
+    warnings.extend(f"ospf: {w}" for w in ospf_topology.warnings)
+
     return connected, warnings
 
 

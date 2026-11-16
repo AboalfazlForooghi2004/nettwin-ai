@@ -1,0 +1,19 @@
+
+            OSPF Router with ID (10.255.255.2) (Process ID 10)
+
+
+		Base Topology (MTID 0)
+
+Area 0
+Prefix               Metric  Type       Next Hop         Interface
+10.0.23.0/30         1       Connected  in 10.0.23.1     Et0/0
+10.0.34.0/30         11      Intra      via 10.0.23.2     Et0/0
+10.0.32.0/30         11      Intra      via 10.0.23.2     Et0/0
+10.0.21.0/30         21      Intra      via 10.0.23.2     Et0/0
+10.0.41.0/30         21      Intra      via 10.0.23.2     Et0/0
+192.168.98.32/27     31      Intra      via 10.0.23.2     Et0/0
+10.255.255.1/32      22      Intra      via 10.0.23.2     Et0/0
+10.255.255.2/32      1       Connected  in 10.0.23.1     Et0/0
+10.255.255.3/32      12      Intra      via 10.0.23.2     Et0/0
+10.255.255.4/32      2       Intra      via 10.0.23.2     Et0/0
+10.255.255.5/32      12      Intra      via 10.0.23.2     Et0/0

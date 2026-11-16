@@ -389,10 +389,17 @@ def test_legacy_device_maps_end_to_end() -> None:
 # =========================================================================== #
 
 
-def test_cisco_command_set_is_unchanged() -> None:
-    """The new dispatch layer must not alter the Cisco allowlist."""
+def test_cisco_command_set_matches_the_allowlist_exactly() -> None:
+    """The vendor profile must never diverge from the collector's allowlist.
+
+    The allowlist itself only grows by review (see
+    ``tests/test_cisco_collector.py``); this test pins the two together so a
+    command cannot be dispatchable through one path and not the other.
+    """
     assert frozenset(CISCO_IOS_COMMANDS) == READ_ONLY_COMMANDS
     assert set(CISCO_IOS_PROFILE.commands) == READ_ONLY_COMMANDS
+    # Phase 2.6: the OSPF commands are optional on the Cisco profile too.
+    assert CISCO_IOS_PROFILE.optional_commands <= READ_ONLY_COMMANDS
 
 
 def test_fortigate_commands_are_get_only() -> None:

@@ -39,6 +39,89 @@ import time
 from pathlib import Path
 
 
+def _ospf_audit(ospf) -> dict:  # noqa: ANN001 - OspfTopology | None
+    """The evidence trail behind the OSPF view, kept separate from ``links``.
+
+    Deliberately does *not* feed ``topology.links``: this records what OSPF
+    claimed and how well it was evidenced, so a reader can see that a transit
+    network was reconstructed without that ever becoming a cable.
+    """
+    if ospf is None:
+        return {
+            "collected": False,
+            "note": "no OSPF evidence was collected during this walk",
+        }
+    return {
+        "collected": True,
+        "routers": [
+            {
+                "router_id": r.router_id,
+                "device_id": r.device_id,
+                "process_ids": r.process_ids,
+                "areas": r.areas,
+            }
+            for r in ospf.routers
+        ],
+        "transit_networks": [
+            {
+                "id": t.id,
+                "area": t.area,
+                "prefix": t.prefix,
+                "dr_address": t.dr_address,
+                "advertising_router": t.advertising_router,
+                "member_router_ids": t.member_router_ids,
+                "member_interface_addresses": t.member_interface_addresses,
+                "state": str(t.state),
+                "evidence": t.evidence,
+                "source_lsas": [
+                    {
+                        "area": ref.area,
+                        "lsa_type": ref.lsa_type,
+                        "link_state_id": ref.link_state_id,
+                        "advertising_router": ref.advertising_router,
+                        "sequence": ref.sequence,
+                        "checksum": ref.checksum,
+                    }
+                    for ref in t.source_lsas
+                ],
+            }
+            for t in ospf.transit_networks
+        ],
+        "stub_networks": [
+            {"prefix": s.prefix, "area": s.area,
+             "advertising_router": s.advertising_router, "metric": s.metric}
+            for s in ospf.stub_networks
+        ],
+        "logical_edges": [
+            {
+                "source_router_id": e.source_router_id,
+                "destination_router_id": e.destination_router_id,
+                "prefix": e.prefix,
+                "area": e.area,
+                "state": str(e.state),
+            }
+            for e in ospf.logical_edges
+        ],
+        "neighbors": [
+            {
+                "device_id": n.device_id,
+                "local_interface": n.local_interface,
+                "neighbor_router_id": n.neighbor_router_id,
+                "neighbor_address": n.neighbor_address,
+                "state": n.state,
+            }
+            for n in ospf.neighbors
+        ],
+        "routes": {
+            "learned": len(ospf.learned_routes()),
+            "connected": len(ospf.connected_routes()),
+            "note": "routing evidence; never used to create a topology link",
+        },
+        "state_counts": ospf.state_counts(),
+        "warnings": ospf.warnings,
+    }
+
+
 def _link_audit(result) -> dict:  # noqa: ANN001 - RecursiveDiscoveryResult
     """The evidence trail behind ``topology.links`` (and behind its absence)."""
     link_result = getattr(result, "link_result", None)
@@ -85,7 +168,12 @@ from nettwin.collect.nested.progress import (  # noqa: E402
     SummaryTable,
 )
 from nettwin.collect.nested.session import SessionLimits  # noqa: E402
-from nettwin.render import render_html, render_svg  # noqa: E402
+from nettwin.render import (  # noqa: E402
+    render_html,
+    render_ospf_html,
+    render_ospf_svg,
+    render_svg,
+)
 
 USERNAME_ENV = "NETTWIN_DEVICE_USERNAME"
 PASSWORD_ENV = "NETTWIN_DEVICE_PASSWORD"
@@ -213,9 +301,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if result.topology is not None:
         topology_path = output_dir / "topology.yaml"
+        # The physical topology document keeps its exact Phase 2.5 shape. OSPF
+        # is added as a *sibling* key, never inside `Topology`: an OSPF
+        # adjacency must never appear in the list of links that a physical
+        # evidence rule confirmed. A consumer that ignores the new key sees the
+        # file it always saw.
+        topology_document = result.topology.model_dump(mode="json")
+        if getattr(result, "ospf_topology", None) is not None:
+            topology_document["ospf"] = result.ospf_topology.model_dump(mode="json")
         topology_path.write_text(
             yaml.safe_dump(
-                result.topology.model_dump(mode="json"), sort_keys=False, allow_unicode=True
+                topology_document, sort_keys=False, allow_unicode=True
             ),
             encoding="utf-8",
         )
@@ -223,6 +319,17 @@ def main(argv: list[str] | None = None) -> int:
               f"{len(result.topology.interfaces)} interfaces, "
               f"{len(result.topology.links)} links, "
               f"{len(result.topology.routes)} routes -> {topology_path}")
+
+        ospf = getattr(result, "ospf_topology", None)
+        if ospf is not None:
+            states = ospf.state_counts()
+            state_word = ", ".join(f"{k} {v}" for k, v in sorted(states.items())) or "none"
+            print(
+                f"ospf       : {len(ospf.routers)} router(s), "
+                f"{len(ospf.transit_networks)} transit network(s), "
+                f"{len(ospf.stub_networks)} stub prefix(es), "
+                f"{len(ospf.learned_routes())} learned route(s) — {state_word}"
+            )
 
         # Visualizations are rendered from the normalized topology only, so a
         # drawing can never show more than the collected evidence supports.
@@ -242,6 +349,30 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:  # noqa: BLE001 - rendering must never fail discovery
             print(f"visualize  : FAILED — {exc} (yaml/discovery output is intact)",
                   file=sys.stderr)
+
+        if ospf is not None:
+            ospf_title = f"{title} — OSPF logical view"
+            ospf_svg_path = output_dir / "ospf.svg"
+            ospf_html_path = output_dir / "ospf.html"
+            try:
+                ospf_svg_path.write_text(
+                    render_ospf_svg(ospf, title=ospf_title, physical=result.topology),
+                    encoding="utf-8",
+                )
+                ospf_html_path.write_text(
+                    render_ospf_html(
+                        ospf,
+                        title=ospf_title,
+                        run_id=str(output_dir.name),
+                        physical=result.topology,
+                    ),
+                    encoding="utf-8",
+                )
+                print(f"ospf view  : {ospf_html_path}")
+                print(f"             {ospf_svg_path}")
+            except Exception as exc:  # noqa: BLE001 - never fail discovery
+                print(f"ospf view  : FAILED — {exc} (yaml/discovery output is intact)",
+                      file=sys.stderr)
     else:
         print("\nmerged     : nothing collected")
 
@@ -279,6 +410,7 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "stats": {"visits": result.visits, "ssh_attempts": result.ssh_attempts},
         "links": _link_audit(result),
+        "ospf": _ospf_audit(getattr(result, "ospf_topology", None)),
         "warnings": result.warnings,
     }
     discovery_path = output_dir / "discovery.yaml"

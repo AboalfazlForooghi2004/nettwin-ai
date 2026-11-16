@@ -40,6 +40,30 @@ def _interface_payload(iface: Interface) -> dict[str, Any]:
     }
 
 
+def _embed_json(payload: object) -> str:
+    """Serialize for embedding inside a ``<script type="application/json">``.
+
+    ``json.dumps`` alone is not safe here. Escaping ``</`` only stops the parser
+    from seeing a literal end tag; a payload such as ``<script>alert(1)</script>``
+    still arrives intact and any consumer doing ``innerHTML`` or naive DOM
+    building executes it. (An IOS *hostname* is attacker-controlled input in the
+    general case, so this is not hypothetical.)
+
+    The HTML spec lets a JSON text be escaped with ``\u003c``/``\u003e``/
+    ``\u0026``: these are valid JSON string escapes, ``json.loads`` and
+    ``JSON.parse`` both restore the original characters, and no ``<`` survives
+    to be mistaken for markup.
+    """
+    text = json.dumps(payload, indent=2, sort_keys=False)
+    return (
+        text.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
 def build_payload(topology: Topology, *, title: str, run_id: str = "") -> dict[str, Any]:
     """Build the JSON payload embedded in the page.
 
@@ -476,9 +500,7 @@ window.addEventListener("resize",fit) ;
 def render_html(topology: Topology, *, title: str = "Network topology", run_id: str = "") -> str:
     """Render a single self-contained interactive HTML document."""
     payload = build_payload(topology, title=title, run_id=run_id)
-    data_json = json.dumps(payload, indent=2, sort_keys=False)
-    # Guard: a literal </script> inside data would close the tag early.
-    data_json = data_json.replace("</", "<\\/")
+    data_json = _embed_json(payload)
     safe_title = escape(title)
     return f"""<!DOCTYPE html>
 <html lang="en">
