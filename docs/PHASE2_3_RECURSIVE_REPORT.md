@@ -6,7 +6,7 @@
 
 | Check | Result |
 |---|---|
-| `python -m pytest` | **337 passed** (274 + 39 recursive + 24 transport) |
+| `python -m pytest` | **342 passed** (274 + 39 recursive + 29 transport) |
 | `python -m ruff check .` | **All checks passed!** |
 | `python scripts/lab_demo.py --no-llm` | **deterministic: PASS / llm loop: PASS** |
 | Domain schema / engine / graph / simulation | **0 files changed** |
@@ -185,7 +185,7 @@ timeout itself, `"api"` relies on netmiko's non-blocking buffered reads, and
 in both cases `SessionLimits.connect_timeout` still bounds `ConnectHandler`
 and `command_timeout` still bounds per-command polling.
 
-**Regression coverage.** `tests/test_netmiko_transport.py` (24 tests) covers
+**Regression coverage.** `tests/test_netmiko_transport.py` (29 tests) covers
 the raw backend, the api backend, `remote_conn=None`, a wrapper that lacks
 `settimeout`, credentials redaction, and an end-to-end session that must reach
 `show cdp neighbors detail` output. One test asserts the original mistake
@@ -244,6 +244,24 @@ diagnostic wording is composed afterwards by `_session_error()`, so it can never
 be shredded. `_sanitize` also has exactly one implementation, shared by the
 session and the transport.
 
+## Third bug: a wrong password looked like a network timeout
+
+`netmiko_root_session` wrapped *every* `ConnectHandler` failure in
+`SessionTimeoutError`, and `_walk` mapped every plain `SessionError` to
+`DeviceStatus.TIMEOUT`. Consequences on the first real run:
+
+- a rejected password would be reported as `timeout`, sending the operator to
+  debug the network instead of the credentials;
+- the warning always said `nested ssh failed`, even for the **seed**, which is
+  reached directly and is not a nested hop.
+
+Connect failures are now classified into the same vocabulary the nodes already
+use (`auth` / `timeout` / `refused` / `hostkey` / `unreachable`) and raised as
+`NestedConnectError(kind=...)`, so `R2-1` with bad credentials becomes
+`auth_failed`, not `timeout`. The warning names the failing hop
+(`connect` vs `nested ssh`). Eight cases are parametrised in the tests against
+real netmiko exception classes.
+
 ## Limitations
 
 1. **No live lab validation.** The acceptance criterion
@@ -266,12 +284,13 @@ session and the transport.
 
 | Requirement | Status |
 |---|---|
-| Automated tests (63 new, 337 total) | ✅ complete |
+| Automated tests (68 new, 342 total) | ✅ complete |
 | CLI requiring only the seed | ✅ complete |
 | Duplicate prevention / cycle detection | ✅ tested |
 | Limits + explicit failure statuses | ✅ tested |
 | Transport `settimeout` crash (live bug) | ✅ **fixed, mocked regression added** |
 | Post-login prompt re-wait / redaction (live bugs) | ✅ **fixed, mocked regression added** |
+| Auth failure reported as a timeout | ✅ **fixed, mocked regression added** |
 | **Live `Ubuntu → R2-1 → R2-2 → R2-4`** | ❌ **not run — operator step** |
 
 > The transport fix is verified against the **installed** netmiko/paramiko

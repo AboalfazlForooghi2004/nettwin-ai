@@ -38,6 +38,7 @@ from typing import Any, Protocol
 
 from nettwin.collect.nested.session import (
     IosShellSession,
+    NestedConnectError,
     SessionError,
     SessionLimits,
     SessionTimeoutError,
@@ -53,6 +54,32 @@ class _ChannelLike(Protocol):
     def sendall(self, data: bytes) -> None: ...
 
     def settimeout(self, timeout: float) -> None: ...
+
+
+def _classify_connect_failure(exc: BaseException, message: str) -> str:
+    """Map a ConnectHandler failure to the status vocabulary used on nodes.
+
+    netmiko 4.x raises ``NetmikoAuthenticationException`` /
+    ``NetmikoTimeoutException``; older releases and raw paramiko raise plain
+    ``AuthenticationException`` / ``socket.timeout``. The message is checked as
+    a fallback because some paths wrap the original error.
+    """
+    name = type(exc).__name__.lower()
+    text = message.lower()
+    if (
+        "authentication" in name
+        or "authentication" in text
+        or "auth failed" in text
+        or "permission denied" in text
+    ):
+        return "auth"
+    if "timeout" in name or "timed out" in text or "timeout expired" in text:
+        return "timeout"
+    if "refused" in text:
+        return "refused"
+    if "host key" in text or "hostkey" in text:
+        return "hostkey"
+    return "unreachable"
 
 
 #: Secret redaction has exactly one implementation; the transport never rolls
@@ -242,8 +269,11 @@ def netmiko_root_session(
             fast_cli=False,
         )
     except Exception as exc:  # netmiko raises a family of socket/auth errors
+        # Report *why*. Calling every connect failure a timeout sends the
+        # operator hunting the network when the password is simply wrong.
         message = _redact(str(exc), password)
-        raise SessionTimeoutError(f"connect to {host} failed: {message}") from None
+        kind = _classify_connect_failure(exc, message)
+        raise NestedConnectError(f"connect to {host} failed: {message}", kind) from None
 
     transport = NetmikoChannelTransport(connection, password=password)
     # ConnectHandler() runs session_preparation(): it authenticates, finds the

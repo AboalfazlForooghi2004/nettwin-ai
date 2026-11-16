@@ -450,3 +450,53 @@ def test_session_error_omits_an_empty_detail() -> None:
 def test_session_error_labels_the_untrusted_part() -> None:
     message = _session_error("host: timeout", "R2-2#", "secret", label="last output")
     assert message == "host: timeout (last output: R2-2#)"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: a wrong password must not be reported as a network timeout.
+# --------------------------------------------------------------------------- #
+
+
+def _auth_failure(**kwargs):
+    from netmiko import NetmikoAuthenticationException
+
+    raise NetmikoAuthenticationException("Authentication failed.")
+
+
+def test_seed_auth_failure_is_not_reported_as_a_timeout() -> None:
+    """netmiko_root_session used to raise SessionTimeoutError for *every* connect
+    failure, so a wrong password showed up as a network timeout and sent the
+    operator debugging the wrong thing."""
+    from nettwin.collect.nested.session import NestedConnectError
+
+    with patch("netmiko.ConnectHandler", _auth_failure):
+        with pytest.raises(NestedConnectError) as excinfo:
+            module.netmiko_root_session("192.168.98.34", PASS, username="u", limits=FAST)
+    assert excinfo.value.kind == "auth"
+    assert PASS not in str(excinfo.value)
+
+
+def test_seed_timeout_is_reported_as_a_timeout() -> None:
+    from netmiko import NetmikoTimeoutException
+
+    from nettwin.collect.nested.session import NestedConnectError
+
+    def timeout(**kwargs):
+        raise NetmikoTimeoutException("TCP connection to device failed.")
+
+    with patch("netmiko.ConnectHandler", timeout):
+        with pytest.raises(NestedConnectError) as excinfo:
+            module.netmiko_root_session("192.168.98.34", PASS, username="u", limits=FAST)
+    assert excinfo.value.kind == "timeout"
+
+
+@pytest.mark.parametrize(
+    ("message", "kind"),
+    [
+        ("[Errno 111] Connection refused", "refused"),
+        ("Host key verification failed", "hostkey"),
+        ("no route to host", "unreachable"),
+    ],
+)
+def test_connect_failure_classification(message: str, kind: str) -> None:
+    assert module._classify_connect_failure(Exception(message), message) == kind

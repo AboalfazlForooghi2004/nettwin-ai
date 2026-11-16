@@ -48,8 +48,10 @@ from nettwin.collect.nested.prompts import failure_reason
 from nettwin.collect.nested.session import (
     IosShellSession,
     NestedConnectError,
+    SessionAuthError,
     SessionError,
     SessionLimits,
+    SessionTimeoutError,
     Transport,
 )
 from nettwin.domain.models import Topology
@@ -268,9 +270,20 @@ class RecursiveDiscovery:
             except NestedConnectError as exc:
                 node.status = _status_for_kind(exc.kind)
                 node.error = str(exc)
-                result.warnings.append(f"{identity}: nested ssh failed ({exc.kind}): {exc}")
-            except SessionError as exc:
+                # The seed is reached directly, not through a nested ssh, so
+                # name the failing hop accurately.
+                hop = "connect" if node.depth == 0 else "nested ssh"
+                result.warnings.append(f"{identity}: {hop} failed ({exc.kind}): {exc}")
+            except SessionAuthError as exc:
+                node.status = DeviceStatus.AUTH_FAILED
+                node.error = str(exc)
+                result.warnings.append(f"{identity}: authentication failed: {exc}")
+            except SessionTimeoutError as exc:
                 node.status = DeviceStatus.TIMEOUT
+                node.error = str(exc)
+                result.warnings.append(f"{identity}: session timeout: {exc}")
+            except SessionError as exc:
+                node.status = DeviceStatus.UNREACHABLE
                 node.error = str(exc)
                 result.warnings.append(f"{identity}: session error: {exc}")
             except CollectorError as exc:
