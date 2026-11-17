@@ -347,7 +347,15 @@ def test_identical_instances_produce_no_disagreement_warning(five_observers) -> 
     assert not [w for w in warnings if "disagreement" in w]
 
 
-def test_conflicting_network_lsa_membership_is_unioned_and_reported() -> None:
+def test_conflicting_network_lsa_membership_is_reported_not_unioned() -> None:
+    """Membership comes from the winning instance only — never a union.
+
+    Unioning would resurrect a router that a newer Network LSA dropped. Here the
+    two observers report the *same* instance (identical sequence and checksum)
+    with different member lists, which is an inconsistent observation rather
+    than two versions, so the canonical list is the winner's alone and the
+    disagreement is flagged.
+    """
     base = _base_observations()
     a = as_observer(base, "a")
     b = as_observer(base, "b")
@@ -364,9 +372,18 @@ def test_conflicting_network_lsa_membership_is_unioned_and_reported() -> None:
     )
 
     assert len(canonical) == 1
-    # No member is lost when observers disagree about membership.
-    assert set(canonical[0].attached_routers) == set(untouched["attached_routers"])
-    assert any("attached-router" in w for w in warnings)
+    # The canonical list is exactly the winner's — no merging.
+    assert canonical[0].attached_routers == sorted(trimmed["attached_routers"])
+    # ...and the dropped member is *not* resurrected by union.
+    dropped = set(untouched["attached_routers"]) - set(trimmed["attached_routers"])
+    assert dropped
+    assert not (dropped & set(canonical[0].attached_routers))
+
+    # The disagreement is reported, and named as inconsistent (same instance).
+    assert any("membership disagreement" in w for w in warnings)
+    assert any("inconsistent observation" in w for w in warnings)
+    # Both observers' reports survive as provenance.
+    assert len(canonical[0].observed_membership) == 2
 
 
 # =========================================================================== #

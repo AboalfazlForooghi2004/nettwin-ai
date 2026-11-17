@@ -20,6 +20,7 @@ Design rules applied here:
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -166,6 +167,14 @@ class OspfRouterLsa(BaseModel):
     looking like five distinct LSAs without throwing the provenance away.
     """
 
+    observed_instances: list[dict[str, str]] = Field(default_factory=list)
+    """What each observer reported for this LSA, when they differed.
+
+    ``[{"observer": "r3", "sequence": "80000002", "checksum": "0x5E6F",
+    "age": "1418"}]``. Empty when every observer agreed. Kept so a resolved
+    conflict is auditable after the winner has been chosen.
+    """
+
 
 class OspfNetworkLsa(BaseModel):
     """A Network LSA (Type 2) — a transit network's DR view."""
@@ -185,6 +194,15 @@ class OspfNetworkLsa(BaseModel):
     command: str = ""
     observed_by: list[str] = Field(default_factory=list)
     """Every device whose LSDB contained this LSA (see ``OspfRouterLsa``)."""
+
+    observed_membership: list[dict[str, Any]] = Field(default_factory=list)
+    """What each observer reported as the attached-router list.
+
+    ``[{"observer": "r3", "attached_routers": [...], "sequence": "80000002",
+    "checksum": "0x5E6F"}]``. The canonical ``attached_routers`` comes from the
+    winning instance alone; this preserves the other reports as evidence
+    without merging stale members back into the canonical LSA.
+    """
 
     @property
     def prefix(self) -> str | None:

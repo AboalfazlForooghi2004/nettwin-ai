@@ -277,3 +277,74 @@ computed once, before use.
 * Reference lab through the real pipeline: 5 router LSAs, 5 network LSAs,
   5 transit networks, 7 stubs, 11 routes on R2 (9 learned / 2 Connected),
   0 missing device IDs, `logical_edges=0` (no reciprocal P2P links exist).
+
+---
+
+## Correction round — RFC 2328 §12.1.6 and §13.1 conformance
+
+A review of `1454096` found three protocol-level defects in the canonical layer:
+the sequence space was parsed unsigned, the ordering was a generic sort key
+rather than §13.1's, and Network-LSA membership was unioned across versions.
+
+### 1. Signed LS sequence numbers (§12.1.6)
+
+`_sequence_value()` did `int(text, 16)`, giving an unsigned value. RFC 2328
+§12.1.6 defines the space as **signed 32-bit**, starting at `0x80000001`, so
+unsigned parsing inverts the ordering across the boundary:
+
+| text | unsigned (wrong) | signed (correct) |
+|---|---|---|
+| `0x80000001` | 2147483649 | **−2147483647** ← oldest |
+| `0x80000009` | 2147483657 | **−2147483639** |
+| `0x7FFFFFFF` | 2147483647 | **2147483647** ← newest |
+
+Unsigned, `0x80000001` beats `0x7FFFFFFF` — the initial sequence number is
+reported as newer than the maximum. `parse_ls_sequence()` now applies two's
+complement. `0x80000000` is **reserved**: it parses but `is_valid_ls_sequence()`
+rejects it, so it can never win a comparison. IOS prints the sequence *without*
+an `0x` prefix while checksums carry one, so both spellings are accepted in
+either case; anything empty, malformed or wider than 8 hex digits returns
+`None` rather than a number that would silently sort somewhere plausible.
+
+### 2. Instance comparison (§13.1)
+
+The generic sort key `(-sequence, age, checksum)` was wrong in two ways: `age`
+was compared **before** `checksum`, and the checksum was compared as a
+**string**. `compare_lsa_instances()` now applies the specification's order
+explicitly:
+
+1. higher **signed** sequence number;
+2. equal sequence → higher **unsigned 16-bit** checksum (never lexicographic:
+   `"0xFFF" > "0x1000"` as text but `4095 < 4096` numerically);
+3. equal sequence and checksum → `age == MaxAge` (3600) wins;
+4. otherwise, if `|age₁ − age₂| > MaxAgeDiff` (900), the **younger** wins;
+5. otherwise the instances are identical.
+
+When the metadata cannot establish a winner — an unusable sequence number, or
+equal sequences with a malformed checksum — the result is `undecided` with
+`winner=None`. The LSA is then **left out of reconstruction** and reported as
+unresolved, with each observer's report listed. Claiming an arbitrary copy is
+the newest LSA would be a guess presented as evidence.
+
+`same_lsa_version()` compares *parsed* values, so `0x80000002`/`0x5E6F` and
+`80000002`/`5e6f` are recognised as one instance rather than a conflict.
+
+### 3. Network-LSA membership is the winner's, not a union
+
+Unioning `attached_routers` across copies resurrected routers that a newer
+Network LSA had dropped — inventing segment membership the LSDB does not
+claim. The canonical list is now **exactly the winning instance's**. Differing
+reports are preserved in `OspfNetworkLsa.observed_membership`, and a warning
+names every observer's list. When observers report the *same* sequence and
+checksum with different membership, that is flagged as an **inconsistent
+observation** of a single instance rather than differing versions.
+
+Router LSAs carry the equivalent per-observer record in
+`observed_instances`, populated only when observers actually disagreed.
+
+### Result
+
+* `741 passed` (690 before; +51 in `tests/test_ospf_lsa_ordering.py`), `ruff check .` clean.
+* Reference lab unchanged: 5 Router LSAs, 5 Network LSAs, 5 transit networks,
+  7 stubs, 11 routes per device (9 learned / 2 Connected), no empty device IDs,
+  CDP untouched, no transit network rendered as a cable.

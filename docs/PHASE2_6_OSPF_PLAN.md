@@ -192,8 +192,8 @@ Integration, all edit-in-place rather than parallel copies:
 
 ### Verification
 
-* `pytest tests/` — **690 passed** (649 at the start of this fix round; +41 new
-  integrity tests). See `docs/PHASE2_6_ROOT_CAUSES.md` for the six defects these
+* `pytest tests/` — **741 passed** (649 at the start of the fix rounds; +41
+  integrity tests, +51 LSA-ordering tests). See `docs/PHASE2_6_ROOT_CAUSES.md` for the six defects these
   tests exist to catch.
 * `ruff check .` — clean.
 * Reference lab reproduced exactly: 5 transit networks, 5 router IDs, 10/10
@@ -211,6 +211,7 @@ Integration, all edit-in-place rather than parallel copies:
 | `tests/test_render_ospf.py` | 51 | SVG/HTML structure, the never-a-cable rule, evidence states, XSS |
 | `tests/test_ospf_outputs.py` | 16 | `topology.yaml` / `discovery.yaml` on disk, backward compatibility |
 | `tests/test_ospf_lsdb_integrity.py` | 41 | canonical LSAs vs observations, observer provenance, observer≠Advertising Router, conflicting LSA instances, attribution completeness, route sources kept separate, the documented stub contract, lab acceptance |
+| `tests/test_ospf_lsa_ordering.py` | 51 | RFC 2328 §12.1.6 signed sequence numbers, §13.1 instance ordering (checksum before age), format-independent version identity, winner-only Network-LSA membership, unresolved-conflict reporting, lab integration |
 
 ### Known limits (stated, not hidden)
 

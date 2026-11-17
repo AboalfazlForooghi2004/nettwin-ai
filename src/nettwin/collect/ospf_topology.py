@@ -135,20 +135,287 @@ class LsaIdentity:
         )
 
 
-def _sequence_value(sequence: str) -> int | None:
-    """``0x80000005`` -> 2147483669, so instances can be ordered as RFC 2328 says."""
+# --------------------------------------------------------------------------- #
+# OSPF protocol constants (RFC 2328)
+# --------------------------------------------------------------------------- #
+
+LS_SEQUENCE_INITIAL = 0x80000001
+"""RFC 2328 §12.1.6: sequence numbers start here and the space is *signed*."""
+
+LS_SEQUENCE_MAX = 0x7FFFFFFF
+"""The largest valid LS sequence number (``0x7FFFFFFF``)."""
+
+LS_SEQUENCE_RESERVED = 0x80000000
+"""Reserved (``0x80000000``) — never a valid sequence number."""
+
+LS_AGE_MAX = 3600
+"""MaxAge in seconds (RFC 2328 §12.1.1 / §A.3)."""
+
+MAX_AGE_DIFF = 900
+"""MaxAgeDiff in seconds (RFC 2328 §12.1.1)."""
+
+
+def parse_ls_sequence(sequence: str) -> int | None:
+    """Parse an LS sequence number as the **signed** 32-bit value of RFC 2328 §12.1.6.
+
+    Sequence numbers live in the signed space that begins at ``0x80000001`` and
+    runs up through ``0x7FFFFFFF``. Interpreted as unsigned, the ordering is
+    wrong across the boundary that wraps through the reserved value
+    ``0x80000000``:
+
+    * ``0x80000001`` → ``-2147483647`` (the *oldest* valid sequence)
+    * ``0x80000009`` → ``-2147483639``
+    * ``0x7FFFFFFF`` → ``2147483647`` (the *newest* valid sequence)
+
+    so ``0x7FFFFFFF`` must compare as newer than ``0x80000001``, which the
+    unsigned form gets backwards.
+
+    IOS prints the sequence **without** an ``0x`` prefix (``LS Seq Number:
+    80000002``) while checksums carry one, so both spellings are accepted, in
+    either case. ``None`` is returned for anything that is not a usable
+    sequence: empty, malformed, or out of the signed 32-bit range.
+    """
     text = (sequence or "").strip()
-    if not text:
+    if text.lower().startswith("0x"):
+        text = text[2:]
+    if not text or len(text) > 8:
         return None
     try:
-        return int(text, 16) if text.lower().startswith("0x") else int(text, 16)
+        unsigned = int(text, 16)
     except ValueError:
         return None
+    if not 0 <= unsigned <= 0xFFFFFFFF:
+        return None
+    # Two's complement, signed 32-bit: the representation RFC 2328 §12.1.6 uses.
+    return unsigned - (1 << 32) if unsigned & 0x80000000 else unsigned
+
+
+def is_valid_ls_sequence(value: int | None) -> bool:
+    """Is ``value`` a sequence number an LSA may legitimately carry?
+
+    ``0x80000000`` is reserved, so ``-2147483648`` is not a valid instance.
+    """
+    return value is not None and value != -(1 << 31) and -2147483647 <= value <= 2147483647
+
+
+def parse_ls_checksum(checksum: str) -> int | None:
+    """Parse an LS checksum as an **unsigned 16-bit** integer.
+
+    IOS reports checksums as ``0x5E6F``. They are compared numerically, never
+    as strings: ``"0x0E6F"`` is numerically smaller than ``"0x1A2B"``, but
+    lexicographically *larger*, so string comparison silently picks the wrong
+    instance.
+    """
+    text = (checksum or "").strip()
+    if text.lower().startswith("0x"):
+        text = text[2:]
+    if not text or len(text) > 4:
+        return None
+    try:
+        value = int(text, 16)
+    except ValueError:
+        return None
+    return value if 0 <= value <= 0xFFFF else None
+
+
+def is_valid_ls_checksum(value: int | None) -> bool:
+    """A checksum is usable when it parsed into the unsigned 16-bit range."""
+    return value is not None
+
+
+def same_lsa_version(
+    first: OspfRouterLsa | OspfNetworkLsa,
+    second: OspfRouterLsa | OspfNetworkLsa,
+) -> bool:
+    """Do two copies claim to be the *same instance* of an LSA?
+
+    Compared on parsed values, not on the reported strings: IOS prints the
+    sequence without an ``0x`` prefix and the checksum with one, and observers
+    may disagree about case or padding. ``"0x80000002"``/``"0x5E6F"`` and
+    ``"80000002"``/``"5e6f"`` are the same version; a raw string comparison
+    would call them a conflict.
+
+    Two unusable metadata pairs are *not* assumed identical — nothing
+    establishes that they match.
+    """
+    sequence_a = parse_ls_sequence(first.sequence)
+    sequence_b = parse_ls_sequence(second.sequence)
+    if sequence_a is None or sequence_b is None:
+        return False
+    if sequence_a != sequence_b:
+        return False
+    checksum_a = parse_ls_checksum(first.checksum)
+    checksum_b = parse_ls_checksum(second.checksum)
+    if checksum_a is None or checksum_b is None:
+        return False
+    return checksum_a == checksum_b
 
 
 def _age_value(age: int | None) -> int:
-    """Age used only as a tie-break: a lower age means a fresher copy."""
+    """Age used as a tie-break; unknown ages sort last (never win a tie)."""
     return age if isinstance(age, int) else 10**9
+
+
+@dataclass(frozen=True)
+class LsaInstanceComparison:
+    """The outcome of comparing two instances of one LSA identity.
+
+    ``winner`` is ``None`` when the available metadata cannot establish a
+    protocol-correct winner. That happens when the sequence numbers are
+    unusable: RFC 2328 §13.1 decides between instances *first* on the sequence
+    number, so with no trustworthy sequence number there is no defensible
+    answer, and an arbitrary pick would be a guess dressed up as evidence.
+    """
+
+    winner: OspfRouterLsa | OspfNetworkLsa | None
+    reason: str
+    """Why the winner won, in protocol terms — carried into the warning text."""
+
+    undecided: bool = False
+    """True when no protocol-correct winner could be established."""
+
+
+def _identical(instance: OspfRouterLsa | OspfNetworkLsa, reason: str) -> LsaInstanceComparison:
+    return LsaInstanceComparison(winner=instance, reason=reason)
+
+
+def compare_lsa_instances(
+    first: OspfRouterLsa | OspfNetworkLsa,
+    second: OspfRouterLsa | OspfNetworkLsa,
+) -> LsaInstanceComparison:
+    """Compare two instances of the same LSA by RFC 2328 §13.1, in order.
+
+    The order is **not** negotiable, and in particular checksum precedes age:
+
+    1. **Higher signed LS sequence number wins** (§12.1.6 signed space).
+    2. Sequence equal → **higher LS checksum wins**, as an unsigned 16-bit
+       integer. A checksum difference always means a different instance, so
+       age is never consulted next.
+    3. Sequence and checksum equal → an instance with ``LS age == MaxAge``
+       wins. MaxAge means "being flushed"; the MaxAge copy is the authoritative
+       statement that the LSA is going away.
+    4. Otherwise, if ``abs(age1 - age2) > MaxAgeDiff``, the **younger** (lower
+       age) instance wins — aging is the only remaining discriminator.
+    5. Otherwise they are the same instance.
+
+    ``first`` is returned as the winner of a tie, so the result is stable
+    across observers.
+    """
+    sequence_a = parse_ls_sequence(first.sequence)
+    sequence_b = parse_ls_sequence(second.sequence)
+
+    if not is_valid_ls_sequence(sequence_a) or not is_valid_ls_sequence(sequence_b):
+        # No defensible ordering exists without a usable sequence number.
+        return LsaInstanceComparison(
+            winner=None,
+            reason=(
+                "unresolved: a usable LS sequence number is missing or invalid "
+                f"(observers report {first.sequence or 'absent'!r} and "
+                f"{second.sequence or 'absent'!r}); RFC 2328 §13.1 orders "
+                "instances on the sequence number first, so no protocol-correct "
+                "newest instance can be established"
+            ),
+            undecided=True,
+        )
+
+    assert sequence_a is not None and sequence_b is not None  # narrowed above
+    if sequence_a != sequence_b:
+        if sequence_a > sequence_b:
+            return LsaInstanceComparison(
+                winner=first, reason=f"higher LS sequence number ({sequence_a})"
+            )
+        return LsaInstanceComparison(
+            winner=second, reason=f"higher LS sequence number ({sequence_b})"
+        )
+
+    checksum_a = parse_ls_checksum(first.checksum)
+    checksum_b = parse_ls_checksum(second.checksum)
+
+    if not is_valid_ls_checksum(checksum_a) or not is_valid_ls_checksum(checksum_b):
+        return LsaInstanceComparison(
+            winner=None,
+            reason=(
+                "unresolved: the LS sequence numbers match but an LS checksum is "
+                f"missing or malformed (observers report {first.checksum or 'absent'!r} "
+                f"and {second.checksum or 'absent'!r}); RFC 2328 §13.1 orders equal "
+                "sequences on the checksum, so no protocol-correct newest instance "
+                "can be established"
+            ),
+            undecided=True,
+        )
+
+    assert checksum_a is not None and checksum_b is not None
+    if checksum_a != checksum_b:
+        if checksum_a > checksum_b:
+            return LsaInstanceComparison(
+                winner=first,
+                reason=f"same sequence, higher checksum (0x{checksum_a:04X})",
+            )
+        return LsaInstanceComparison(
+            winner=second,
+            reason=f"same sequence, higher checksum (0x{checksum_b:04X})",
+        )
+
+    # Sequence and checksum agree: the same LSA body, differing only in age.
+    age_a = first.age
+    age_b = second.age
+
+    if age_a == LS_AGE_MAX and age_b != LS_AGE_MAX:
+        return LsaInstanceComparison(winner=first, reason="MaxAge instance wins")
+    if age_b == LS_AGE_MAX and age_a != LS_AGE_MAX:
+        return LsaInstanceComparison(winner=second, reason="MaxAge instance wins")
+
+    if isinstance(age_a, int) and isinstance(age_b, int):
+        if age_a != age_b and abs(age_a - age_b) > MAX_AGE_DIFF:
+            if age_a < age_b:
+                return LsaInstanceComparison(
+                    winner=first,
+                    reason=f"younger instance (age {age_a} vs {age_b}, exceeds MaxAgeDiff)",
+                )
+            return LsaInstanceComparison(
+                winner=second,
+                reason=f"younger instance (age {age_b} vs {age_a}, exceeds MaxAgeDiff)",
+            )
+
+    return _identical(first, "identical instance (sequence, checksum and age agree)")
+
+
+def _single_version(copies: list[OspfRouterLsa] | list[OspfNetworkLsa]) -> bool:
+    """Do all copies agree that they are the same instance version?
+
+    Used to decide whether observers are reporting *different versions* of an
+    LSA or *the same version* with different content. Comparison is on parsed
+    sequence/checksum, so formatting differences are not mistaken for conflicts.
+    """
+    if len(copies) < 2:
+        return True
+    reference = copies[0]
+    return all(same_lsa_version(reference, other) for other in copies[1:])
+
+
+def select_lsa_instance(
+    copies: list[OspfRouterLsa] | list[OspfNetworkLsa],
+) -> LsaInstanceComparison:
+    """Pick the winning instance among every observer's copy of one LSA.
+
+    Folds :func:`compare_lsa_instances` across the copies. If any pair cannot be
+    ordered, the whole selection is undecided — a partially-ordered LSDB is not
+    evidence of which instance is current.
+    """
+    if not copies:
+        return LsaInstanceComparison(winner=None, reason="no copies", undecided=True)
+
+    best = copies[0]
+    reason = "only one instance observed"
+    for candidate in copies[1:]:
+        comparison = compare_lsa_instances(best, candidate)
+        if comparison.undecided:
+            return comparison
+        assert comparison.winner is not None
+        if comparison.winner is candidate:
+            best = candidate
+            reason = comparison.reason
+    return LsaInstanceComparison(winner=best, reason=reason)
 
 
 def canonical_router_lsas(
@@ -184,36 +451,55 @@ def canonical_router_lsas(
         copies = grouped[identity]
         observers = sorted({c.device_id for c in copies if c.device_id})
 
-        chosen = sorted(
-            copies,
-            key=lambda c: (
-                -(_sequence_value(c.sequence) or -1),
-                _age_value(c.age),
-                c.checksum,
-            ),
-        )[0]
+        selection = select_lsa_instance(copies)
+        chosen = selection.winner
+        if chosen is None:
+            # No protocol-correct winner exists. Keep every observation, claim
+            # nothing about which is current, and say exactly why.
+            warnings.append(
+                f"OSPF LSDB conflict on {identity.describe()} could not be resolved: "
+                f"{selection.reason}. No instance was chosen; the LSA is left out "
+                "of reconstruction until the LSDB agrees or is re-collected."
+            )
+            warnings.extend(
+                f"OSPF LSDB unresolved {identity.describe()}: observer "
+                f"{c.device_id or '?'} reports seq {c.sequence or 'absent'} "
+                f"checksum {c.checksum or 'absent'} age {c.age}"
+                for c in sorted(copies, key=lambda c: c.device_id)
+            )
+            continue
 
-        versions = {
-            (c.sequence, c.checksum) for c in copies if c.sequence or c.checksum
-        }
-        if len(versions) > 1:
+        per_observer: list[dict[str, str]] = []
+        if not _single_version(copies):
             detail = ", ".join(
                 f"{c.device_id or '?'}={c.sequence or '?'}/{c.checksum or '?'}"
                 for c in sorted(copies, key=lambda c: c.device_id)
             )
             warnings.append(
                 f"OSPF LSDB disagreement on {identity.describe()}: observers report "
-                f"different instances ({detail}); the highest sequence "
-                f"({chosen.sequence or 'unknown'}) was used and the conflict is "
-                "preserved here rather than resolved silently"
+                f"different instances ({detail}); {selection.reason} was used and the "
+                "conflict is preserved here rather than resolved silently"
             )
+            per_observer = [
+                {
+                    "observer": c.device_id or "?",
+                    "sequence": c.sequence,
+                    "checksum": c.checksum,
+                    "age": "" if c.age is None else str(c.age),
+                }
+                for c in sorted(copies, key=lambda c: c.device_id)
+            ]
 
         # Re-emit the chosen instance as the canonical record, carrying the full
         # observer set. A copy built from one device is not mutated in place:
         # the original objects stay owned by their observer.
         canonical.append(
             chosen.model_copy(
-                update={"observed_by": observers, "device_id": chosen.device_id}
+                update={
+                    "observed_by": observers,
+                    "device_id": chosen.device_id,
+                    "observed_instances": per_observer,
+                }
             )
         )
     return canonical
@@ -224,9 +510,16 @@ def canonical_network_lsas(
 ) -> list[OspfNetworkLsa]:
     """Collapse every observer's copy of a Network LSA into one canonical record.
 
-    Attached-router lists are unioned: if two routers' copies of the same
-    Network LSA disagree about membership, both views are kept and the
-    disagreement is reported, rather than one observer being trusted.
+    The winning instance is chosen with :func:`select_lsa_instance` (RFC 2328
+    §13.1) and its attached-router list is the canonical list — **only** the
+    winner's. Membership is never unioned across instances: a Network LSA names
+    the routers the DR currently has on the segment, so merging a stale copy's
+    list would resurrect a router that has since left and manufacture a segment
+    member the LSDB does not claim.
+
+    Differing observations are still preserved, in
+    :attr:`OspfNetworkLsa.observed_membership` and in a warning, so the
+    disagreement remains auditable after the winner has been selected.
     """
     grouped: dict[LsaIdentity, list[OspfNetworkLsa]] = defaultdict(list)
     for device in devices:
@@ -247,40 +540,67 @@ def canonical_network_lsas(
     ):
         copies = grouped[identity]
         observers = sorted({c.device_id for c in copies if c.device_id})
-        chosen = sorted(
-            copies,
-            key=lambda c: (
-                -(_sequence_value(c.sequence) or -1),
-                _age_value(c.age),
-                c.checksum,
-            ),
-        )[0]
 
-        versions = {
-            (c.sequence, c.checksum) for c in copies if c.sequence or c.checksum
-        }
-        if len(versions) > 1:
+        selection = select_lsa_instance(copies)
+        chosen = selection.winner
+        if chosen is None:
+            warnings.append(
+                f"OSPF LSDB conflict on {identity.describe()} could not be resolved: "
+                f"{selection.reason}. No instance was chosen; the transit network is "
+                "left out of reconstruction until the LSDB agrees or is re-collected."
+            )
+            warnings.extend(
+                f"OSPF LSDB unresolved {identity.describe()}: observer "
+                f"{c.device_id or '?'} reports seq {c.sequence or 'absent'} "
+                f"checksum {c.checksum or 'absent'} age {c.age} "
+                f"members {sorted(c.attached_routers)}"
+                for c in sorted(copies, key=lambda c: c.device_id)
+            )
+            continue
+
+        if not _single_version(copies):
             detail = ", ".join(
                 f"{c.device_id or '?'}={c.sequence or '?'}/{c.checksum or '?'}"
                 for c in sorted(copies, key=lambda c: c.device_id)
             )
             warnings.append(
                 f"OSPF LSDB disagreement on {identity.describe()}: observers report "
-                f"different instances ({detail}); the highest sequence "
-                f"({chosen.sequence or 'unknown'}) was used and the conflict is "
-                "preserved here rather than resolved silently"
+                f"different instances ({detail}); {selection.reason} was used and the "
+                "conflict is preserved here rather than resolved silently"
             )
 
-        membership_views = {
-            frozenset(c.attached_routers) for c in copies if c.attached_routers
-        }
-        if len(membership_views) > 1:
-            warnings.append(
-                f"OSPF LSDB disagreement on {identity.describe()}: observers report "
-                "different attached-router lists; the union is used so no member "
-                "is lost"
+        # Membership comes from the **winning instance only**. A Network LSA
+        # states which routers the DR currently has on the segment; unioning
+        # stale copies would resurrect a router that has since been removed,
+        # inventing a segment member the current LSDB does not claim.
+        attached = sorted(chosen.attached_routers)
+
+        # Differing reports are still preserved as evidence — just not merged.
+        variants: dict[frozenset[str], list[str]] = defaultdict(list)
+        for copy in sorted(copies, key=lambda c: c.device_id):
+            variants[frozenset(copy.attached_routers)].append(copy.device_id or "?")
+        if len(variants) > 1:
+            reports = "; ".join(
+                f"{', '.join(devices)} report {sorted(members)}"
+                for members, devices in sorted(
+                    variants.items(), key=lambda kv: (len(kv[0]), sorted(kv[1]))
+                )
             )
-        attached = sorted({r for c in copies for r in c.attached_routers})
+            warning = (
+                f"OSPF Network LSA membership disagreement on {identity.describe()}: "
+                f"{reports}. The canonical list is the winner's "
+                f"({sorted(chosen.attached_routers)}) from {chosen.device_id or '?'}; "
+                "members from other instances are not merged in."
+            )
+            if _single_version(copies):
+                # Same instance, different content: not a stale copy, a corrupt
+                # or mistranscribed observation.
+                warning += (
+                    " All observers report the same sequence and checksum, so this "
+                    "is an inconsistent observation of a single instance rather "
+                    "than differing versions."
+                )
+            warnings.append(warning)
 
         canonical.append(
             chosen.model_copy(
@@ -288,6 +608,15 @@ def canonical_network_lsas(
                     "attached_routers": attached,
                     "observed_by": observers,
                     "device_id": chosen.device_id,
+                    "observed_membership": [
+                        {
+                            "observer": c.device_id or "?",
+                            "attached_routers": sorted(c.attached_routers),
+                            "sequence": c.sequence,
+                            "checksum": c.checksum,
+                        }
+                        for c in sorted(copies, key=lambda c: c.device_id)
+                    ],
                 }
             )
         )
