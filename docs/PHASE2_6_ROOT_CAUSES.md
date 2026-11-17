@@ -348,3 +348,82 @@ Router LSAs carry the equivalent per-observer record in
 * Reference lab unchanged: 5 Router LSAs, 5 Network LSAs, 5 transit networks,
   7 stubs, 11 routes per device (9 learned / 2 Connected), no empty device IDs,
   CDP untouched, no transit network rendered as a cable.
+
+---
+
+## Third correction round — LS Age strictness, determinism, zero checksum
+
+The read-only audit of `e6b6b7a` confirmed three defects, all rooted in one
+problem: **the code had no way to express "this field is unusable" for LS Age**,
+so unusable metadata fell through to a confident claim of agreement.
+
+### 1. Strict LS Age validation
+
+`parse_ls_age()` accepts only genuine integers in `0..MaxAge (3600)`. It rejects
+`bool` (otherwise `True` becomes age 1 — a real, young age), `float` (no
+truncating `1418.7` into an age), numeric strings (the parser already converts;
+a string means the caller bypassed it), `None`, and anything outside the range.
+Values are never clamped: `5000` is malformed, and clamping it to 3600 would
+manufacture a MaxAge flush claim the LSA never made.
+
+`_identical()` now takes both **validated** ages as arguments, so "identical"
+can only be claimed by a caller that established it. Previously it accepted a
+free-text reason and no age at all. `compare_lsa_instances()` returns
+`undecided` when sequence and checksum tie but an age is unusable — including
+the specific case of **MaxAge versus an unknown age**, which used to return the
+MaxAge copy.
+
+### 2. Deterministic multi-observer canonicalisation
+
+The old `select_lsa_instance()` folded `compare_lsa_instances()` pairwise.
+That is unsound because §13.1's age rule (`abs(a-b) <= MaxAgeDiff => same
+instance`) is **not transitive**. With ages 100/800/1700 every pair is within
+900, and a left-to-right fold returned 100 while starting at 800 returned 800 —
+the canonical LSA depended on collection order. Measured: identical LSDB,
+canonical metric 10 or 20, silently, no warning.
+
+A relation that is not an order cannot be folded, so selection now aggregates
+over the whole set, applying the precedence to the set:
+
+1. **Sequence** — highest signed number; an unparseable sequence makes the
+   whole selection unresolved.
+2. **Checksum** — highest valid unsigned 16-bit value at that sequence.
+3. **MaxAge** — surviving MaxAge copies win.
+4. **Age spread** — beyond MaxAgeDiff, the youngest copies win; within it, every
+   copy is the same instance per the protocol.
+5. **Content** — a tie may only be resolved when the surviving copies agree
+   about the LSA body, compared by `lsa_content_fingerprint()`, which excludes
+   age and observer metadata. Differing bodies make the result **unresolved**
+   with a warning naming every observer; no body is silently preferred.
+
+The representative is chosen by `(age, device_id, command)`, so the result is
+invariant under all input permutations — verified across all six permutations of
+100/800/1700 — while `observed_by` is still built from the full observation set,
+so determinism costs no provenance.
+
+### 3. Zero checksum rejected
+
+RFC 2328 §§12.1.7 and 13.1: the checksum is an unsigned 16-bit Fletcher field,
+and a real LSA's checksum cannot be zero. `0x0000` means absent, mistranscribed
+or corrupt. `parse_ls_checksum()` now returns `None` for zero and
+`is_valid_ls_checksum()` rejects it, so malformed metadata can no longer act as
+the §13.1 tie-break. Values above 65535 were already rejected; 1 and 65535
+remain valid.
+
+### Test correction
+
+`test_missing_ages_never_win_a_tie` previously asserted
+`winner is unknown or winner is known` — a tautology — and required the reason
+to contain "identical", which is precisely the bug. It now requires
+`undecided is True`, `winner is None`, and no "identical" claim, in both
+directions. Three further tests that expected a canonical record where the
+stricter contract now withholds one were updated to the new contract, not
+weakened: they assert *less* output and *more* evidence.
+
+### Result
+
+* `795 passed` (741 before; +54 in this round), `ruff check .` clean.
+* Reference lab unchanged and warning-free: 5 Router LSAs, 5 Network LSAs,
+  5 transit networks, 7 stubs, 11 routes per device (9 learned / 2 Connected),
+  0 missing device IDs, correct per-router attribution, full `observed_by`
+  provenance, `logical_edges=0`.

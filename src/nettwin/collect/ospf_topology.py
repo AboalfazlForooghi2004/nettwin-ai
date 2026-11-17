@@ -215,12 +215,20 @@ def parse_ls_checksum(checksum: str) -> int | None:
         value = int(text, 16)
     except ValueError:
         return None
-    return value if 0 <= value <= 0xFFFF else None
+    return value if 0 < value <= 0xFFFF else None
 
 
 def is_valid_ls_checksum(value: int | None) -> bool:
-    """A checksum is usable when it parsed into the unsigned 16-bit range."""
-    return value is not None
+    """Is ``value`` a usable LS checksum?
+
+    RFC 2328 §§12.1.7 and 13.1: the checksum is an unsigned 16-bit field
+    computed with the Fletcher algorithm over the LSA. **Zero is not a
+    checksum** — a Fletcher checksum of a real LSA cannot be 0, so ``0x0000``
+    means the field was absent, mistranscribed or the LSA is corrupt. Accepting
+    it would let malformed metadata act as the tie-break that decides which
+    instance is canonical.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 0xFFFF
 
 
 def same_lsa_version(
@@ -251,9 +259,38 @@ def same_lsa_version(
     return checksum_a == checksum_b
 
 
-def _age_value(age: int | None) -> int:
-    """Age used as a tie-break; unknown ages sort last (never win a tie)."""
-    return age if isinstance(age, int) else 10**9
+def parse_ls_age(age: object) -> int | None:
+    """Validate an LS age, returning ``None`` when it is not usable evidence.
+
+    RFC 2328 §12.1.1 defines LS age as a 16-bit *unsigned* seconds counter that
+    saturates at ``MaxAge`` (3600); a value outside ``0..3600`` cannot have come
+    from a conforming LSDB.
+
+    Validation is deliberately strict, because every lenient behaviour here
+    would narrow to "a number appeared, so the instances must agree":
+
+    * ``bool`` is **rejected** even though it is an ``int`` subclass — ``True``
+      would otherwise silently become age 1, which is a real, young age;
+    * ``float`` is **rejected** rather than truncated — ``1418.7`` is not an
+      age, and rounding it invents precision the device never reported;
+    * numeric *strings* are **rejected** rather than coerced — the parser has
+      already converted the transcript, so a string here means a caller bypassed
+      it and the value's provenance is unknown;
+    * ``None`` and anything else non-integer is rejected.
+
+    Nothing is clamped. ``5000`` is not "MaxAge-ish", it is malformed, and
+    clamping it to 3600 would manufacture a MaxAge claim the LSA never made.
+    """
+    if isinstance(age, bool) or not isinstance(age, int):
+        return None
+    if age < 0 or age > LS_AGE_MAX:
+        return None
+    return age
+
+
+def is_valid_ls_age(age: object) -> bool:
+    """Is ``age`` a usable LS age (0..MaxAge, a genuine integer)?"""
+    return parse_ls_age(age) is not None
 
 
 @dataclass(frozen=True)
@@ -275,8 +312,27 @@ class LsaInstanceComparison:
     """True when no protocol-correct winner could be established."""
 
 
-def _identical(instance: OspfRouterLsa | OspfNetworkLsa, reason: str) -> LsaInstanceComparison:
-    return LsaInstanceComparison(winner=instance, reason=reason)
+def _identical(
+    first: OspfRouterLsa | OspfNetworkLsa,
+    second: OspfRouterLsa | OspfNetworkLsa,
+    age_a: int,
+    age_b: int,
+) -> LsaInstanceComparison:
+    """The two copies are the same instance, and that was *verified*.
+
+    Takes both validated ages as arguments so "identical" can only be claimed
+    by a caller that actually established it. The previous signature accepted a
+    free-text reason and no age at all, which let unusable metadata fall
+    through to a confident "the sequence, checksum and age agree".
+    """
+    spread = abs(age_a - age_b)
+    return LsaInstanceComparison(
+        winner=first,
+        reason=(
+            f"identical instance (sequence and checksum match; ages {age_a} and "
+            f"{age_b} are within MaxAgeDiff {MAX_AGE_DIFF}, spread {spread}s)"
+        ),
+    )
 
 
 def compare_lsa_instances(
@@ -357,27 +413,42 @@ def compare_lsa_instances(
         )
 
     # Sequence and checksum agree: the same LSA body, differing only in age.
-    age_a = first.age
-    age_b = second.age
+    # Both ages must now be *validated* before age can decide anything.
+    age_a = parse_ls_age(first.age)
+    age_b = parse_ls_age(second.age)
 
+    if age_a is None or age_b is None:
+        return LsaInstanceComparison(
+            winner=None,
+            reason=(
+                "unresolved: the LS sequence numbers and checksums match, so only "
+                "LS Age can distinguish these copies, but an age is missing or "
+                "invalid (observers report "
+                f"{first.age!r} and {second.age!r}; a valid age is an integer in "
+                f"0..{LS_AGE_MAX})"
+            ),
+            undecided=True,
+        )
+
+    # MaxAge is authoritative: it states the LSA is being flushed. It may only
+    # be compared against a *known* age, which the check above guarantees.
     if age_a == LS_AGE_MAX and age_b != LS_AGE_MAX:
         return LsaInstanceComparison(winner=first, reason="MaxAge instance wins")
     if age_b == LS_AGE_MAX and age_a != LS_AGE_MAX:
         return LsaInstanceComparison(winner=second, reason="MaxAge instance wins")
 
-    if isinstance(age_a, int) and isinstance(age_b, int):
-        if age_a != age_b and abs(age_a - age_b) > MAX_AGE_DIFF:
-            if age_a < age_b:
-                return LsaInstanceComparison(
-                    winner=first,
-                    reason=f"younger instance (age {age_a} vs {age_b}, exceeds MaxAgeDiff)",
-                )
+    if age_a != age_b and abs(age_a - age_b) > MAX_AGE_DIFF:
+        if age_a < age_b:
             return LsaInstanceComparison(
-                winner=second,
-                reason=f"younger instance (age {age_b} vs {age_a}, exceeds MaxAgeDiff)",
+                winner=first,
+                reason=f"younger instance (age {age_a} vs {age_b}, exceeds MaxAgeDiff)",
             )
+        return LsaInstanceComparison(
+            winner=second,
+            reason=f"younger instance (age {age_b} vs {age_a}, exceeds MaxAgeDiff)",
+        )
 
-    return _identical(first, "identical instance (sequence, checksum and age agree)")
+    return _identical(first, second, age_a, age_b)
 
 
 def _single_version(copies: list[OspfRouterLsa] | list[OspfNetworkLsa]) -> bool:
@@ -393,29 +464,199 @@ def _single_version(copies: list[OspfRouterLsa] | list[OspfNetworkLsa]) -> bool:
     return all(same_lsa_version(reference, other) for other in copies[1:])
 
 
+def lsa_content_fingerprint(
+    lsa: OspfRouterLsa | OspfNetworkLsa,
+) -> tuple[object, ...]:
+    """A comparable fingerprint of an LSA's **body**, excluding LS Age.
+
+    The body is everything the LSA actually asserts: for a Router LSA its links
+    and their metrics, for a Network LSA its mask and attached routers. Age is
+    excluded because ageing is a transport property — two copies of one instance
+    legitimately differ only in how long each router has held them.
+
+    Observer identity and command provenance are excluded too: they describe
+    *who looked*, not *what was seen*.
+    """
+    if isinstance(lsa, OspfNetworkLsa):
+        return (
+            "network",
+            lsa.network_mask,
+            tuple(sorted(lsa.attached_routers)),
+        )
+    return (
+        "router",
+        tuple(
+            sorted(
+                (
+                    str(link.link_type),
+                    link.link_id,
+                    link.link_data,
+                    link.network_mask,
+                    link.metric,
+                    link.mtid,
+                )
+                for link in lsa.links
+            )
+        ),
+    )
+
+
 def select_lsa_instance(
     copies: list[OspfRouterLsa] | list[OspfNetworkLsa],
 ) -> LsaInstanceComparison:
-    """Pick the winning instance among every observer's copy of one LSA.
+    """Pick the winning instance from **all** observations, order-independently.
 
-    Folds :func:`compare_lsa_instances` across the copies. If any pair cannot be
-    ordered, the whole selection is undecided — a partially-ordered LSDB is not
-    evidence of which instance is current.
+    The previous implementation folded pairwise comparisons sequentially. That
+    is unsound here: RFC 2328 §13.1's age rule is ``abs(a-b) <= MaxAgeDiff =>
+    same instance``, which is **not transitive**. With ages 100/800/1700 (every
+    pair within 900), folding left-to-right kept 100, but starting at 800 kept
+    800 — the canonical LSA depended on which device happened to be collected
+    first. A relation that is not an order cannot be folded.
+
+    So this aggregates over the whole set instead, applying §13.1's precedence
+    to the set rather than to a running pair:
+
+    1. **Sequence** — highest signed sequence number. Copies whose sequence
+       cannot be parsed make the whole selection unresolved.
+    2. **Checksum** — among copies at the winning sequence, highest valid
+       unsigned 16-bit checksum.
+    3. **MaxAge** — if any surviving copy is exactly MaxAge, those copies win.
+    4. **Age spread** — if ``max(age) - min(age) > MaxAgeDiff`` the youngest
+       copies win; if the spread is within MaxAgeDiff every copy is the same
+       instance as far as the protocol is concerned, and the representative is
+       chosen deterministically below.
+    5. **Content** — a tie may only be resolved if the surviving copies agree
+       about the LSA body (see :func:`lsa_content_fingerprint`). Disagreement is
+       reported as an unresolved inconsistency, never silently resolved.
+
+    Observer provenance is never discarded: ``observed_by`` is built by the
+    caller from the same set, so a deterministic pick cannot erase an observer.
     """
     if not copies:
         return LsaInstanceComparison(winner=None, reason="no copies", undecided=True)
 
-    best = copies[0]
-    reason = "only one instance observed"
-    for candidate in copies[1:]:
-        comparison = compare_lsa_instances(best, candidate)
-        if comparison.undecided:
-            return comparison
-        assert comparison.winner is not None
-        if comparison.winner is candidate:
-            best = candidate
-            reason = comparison.reason
-    return LsaInstanceComparison(winner=best, reason=reason)
+    # --- 1. sequence ------------------------------------------------------- #
+    sequenced: list[tuple[int, OspfRouterLsa | OspfNetworkLsa]] = []
+    for copy in copies:
+        value = parse_ls_sequence(copy.sequence)
+        if not is_valid_ls_sequence(value):
+            return LsaInstanceComparison(
+                winner=None,
+                reason=(
+                    "unresolved: an observer reports a missing or invalid LS "
+                    f"sequence number ({copy.sequence or 'absent'!r} from "
+                    f"{copy.device_id or '?'}); RFC 2328 §13.1 orders instances on "
+                    "the sequence number first"
+                ),
+                undecided=True,
+            )
+        assert value is not None
+        sequenced.append((value, copy))
+
+    best_sequence = max(value for value, _ in sequenced)
+    candidates = [c for value, c in sequenced if value == best_sequence]
+
+    # --- 2. checksum ------------------------------------------------------- #
+    checked: list[tuple[int, OspfRouterLsa | OspfNetworkLsa]] = []
+    for copy in candidates:
+        value = parse_ls_checksum(copy.checksum)
+        if not is_valid_ls_checksum(value):
+            return LsaInstanceComparison(
+                winner=None,
+                reason=(
+                    "unresolved: copies agree on LS sequence "
+                    f"{best_sequence} but an LS checksum is missing, malformed or "
+                    f"zero ({copy.checksum or 'absent'!r} from "
+                    f"{copy.device_id or '?'}); RFC 2328 §13.1 orders equal "
+                    "sequences on the checksum"
+                ),
+                undecided=True,
+            )
+        assert value is not None
+        checked.append((value, copy))
+
+    best_checksum = max(value for value, _ in checked)
+    candidates = [c for value, c in checked if value == best_checksum]
+
+    sequence_reason = f"sequence {best_sequence}, checksum 0x{best_checksum:04X}"
+    if len(candidates) == 1:
+        return LsaInstanceComparison(
+            winner=candidates[0], reason=f"highest {sequence_reason}"
+        )
+
+    # --- 3. MaxAge --------------------------------------------------------- #
+    aged: list[tuple[int, OspfRouterLsa | OspfNetworkLsa]] = []
+    for copy in candidates:
+        age = parse_ls_age(copy.age)
+        if age is None:
+            return LsaInstanceComparison(
+                winner=None,
+                reason=(
+                    f"unresolved: copies agree on {sequence_reason}, so only LS Age "
+                    "can distinguish them, but an age is missing or invalid "
+                    f"({copy.age!r} from {copy.device_id or '?'}; a valid age is an "
+                    f"integer in 0..{LS_AGE_MAX})"
+                ),
+                undecided=True,
+            )
+        aged.append((age, copy))
+
+    max_age_copies = [c for age, c in aged if age == LS_AGE_MAX]
+    if max_age_copies and len(max_age_copies) < len(candidates):
+        reason = f"{sequence_reason}; MaxAge instance wins"
+        candidates = max_age_copies
+        if len(candidates) == 1:
+            return LsaInstanceComparison(winner=candidates[0], reason=reason)
+    else:
+        reason = sequence_reason
+
+    # --- 4. age spread ----------------------------------------------------- #
+    ages = [age for age, _ in aged]
+    youngest = min(ages)
+    oldest = max(ages)
+    if oldest - youngest > MAX_AGE_DIFF:
+        contenders = [c for age, c in aged if age == youngest]
+        reason = (
+            f"{reason}; age spread {oldest - youngest}s exceeds MaxAgeDiff "
+            f"{MAX_AGE_DIFF}, youngest instance (age {youngest}) wins"
+        )
+        if len(contenders) == 1:
+            return LsaInstanceComparison(winner=contenders[0], reason=reason)
+        candidates = contenders
+    else:
+        reason = (
+            f"{reason}; ages {sorted(set(ages))} span {oldest - youngest}s, within "
+            f"MaxAgeDiff {MAX_AGE_DIFF}, so every copy is the same instance"
+        )
+
+    # --- 5. content -------------------------------------------------------- #
+    fingerprints = {lsa_content_fingerprint(c) for c in candidates}
+    if len(fingerprints) > 1:
+        return LsaInstanceComparison(
+            winner=None,
+            reason=(
+                f"unresolved: copies agree on {sequence_reason} and are within "
+                f"MaxAgeDiff of each other, but their LSA content differs — "
+                f"{len(fingerprints)} distinct bodies are reported for one instance "
+                "(observers: "
+                + ", ".join(sorted(c.device_id or "?" for c in candidates))
+                + "). Choosing one body would silently discard the others"
+            ),
+            undecided=True,
+        )
+
+    # Same instance, same body: pick deterministically so the result cannot
+    # depend on input order.
+    chosen = min(
+        candidates, key=lambda c: (parse_ls_age(c.age), c.device_id or "", c.command)
+    )
+    return LsaInstanceComparison(
+        winner=chosen,
+        reason=(
+            f"{reason}; content is identical across observers, youngest copy "
+            f"(age {parse_ls_age(chosen.age)}) chosen as representative"
+        ),
+    )
 
 
 def canonical_router_lsas(
@@ -549,6 +790,26 @@ def canonical_network_lsas(
                 f"{selection.reason}. No instance was chosen; the transit network is "
                 "left out of reconstruction until the LSDB agrees or is re-collected."
             )
+            # When the copies agree on sequence and checksum but not on
+            # membership, say so in membership terms: "content differs" is
+            # accurate but not diagnosable for a Network LSA.
+            variants: dict[frozenset[str], list[str]] = defaultdict(list)
+            for copy in sorted(copies, key=lambda c: c.device_id):
+                variants[frozenset(copy.attached_routers)].append(copy.device_id or "?")
+            if _single_version(copies) and len(variants) > 1:
+                reports = "; ".join(
+                    f"{', '.join(devices)} report {sorted(members)}"
+                    for members, devices in sorted(
+                        variants.items(), key=lambda kv: (len(kv[0]), sorted(kv[1]))
+                    )
+                )
+                warnings.append(
+                    f"OSPF Network LSA membership disagreement on "
+                    f"{identity.describe()}: {reports}. All observers report the "
+                    "same sequence and checksum, so this is an inconsistent "
+                    "observation of a single instance rather than differing "
+                    "versions; no membership list was chosen."
+                )
             warnings.extend(
                 f"OSPF LSDB unresolved {identity.describe()}: observer "
                 f"{c.device_id or '?'} reports seq {c.sequence or 'absent'} "

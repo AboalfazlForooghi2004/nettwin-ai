@@ -371,19 +371,18 @@ def test_conflicting_network_lsa_membership_is_reported_not_unioned() -> None:
         [ospf_device_data(a, "a"), ospf_device_data(b, "b")], warnings
     )
 
-    assert len(canonical) == 1
-    # The canonical list is exactly the winner's — no merging.
-    assert canonical[0].attached_routers == sorted(trimmed["attached_routers"])
-    # ...and the dropped member is *not* resurrected by union.
+    # The two observers report the same instance with different membership, so
+    # neither list may be published: the LSA is withheld rather than unioned.
+    assert canonical == []
     dropped = set(untouched["attached_routers"]) - set(trimmed["attached_routers"])
     assert dropped
-    assert not (dropped & set(canonical[0].attached_routers))
-
-    # The disagreement is reported, and named as inconsistent (same instance).
+    # The disagreement is reported, in membership terms...
     assert any("membership disagreement" in w for w in warnings)
     assert any("inconsistent observation" in w for w in warnings)
-    # Both observers' reports survive as provenance.
-    assert len(canonical[0].observed_membership) == 2
+    # ...and both observers' reports survive in the evidence.
+    assert any("10.255.255.3" in w for w in warnings)
+    # The dropped member is not resurrected into any reconstructed object.
+    assert canonical == []
 
 
 # =========================================================================== #

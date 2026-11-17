@@ -274,12 +274,23 @@ def test_age_does_not_override_a_checksum_difference() -> None:
 
 
 def test_missing_ages_never_win_a_tie() -> None:
+    """An unknown age is absence of evidence, not evidence of agreement.
+
+    The previous version of this test asserted ``winner is unknown or winner is
+    known`` — always true — and required the reason to say "identical", which
+    is exactly the bug: unusable metadata fell through to a confident claim
+    that the copies agreed. Now the comparison must be unresolved in both
+    directions.
+    """
     known = rlsa(checksum="0x1111", age=100)
     unknown = rlsa(checksum="0x1111", age=None)
-    comparison = compare_lsa_instances(unknown, known)
-    # Nothing distinguishes them but age, and an unknown age is not evidence of youth.
-    assert comparison.winner is unknown or comparison.winner is known
-    assert "identical" in comparison.reason
+
+    for first, second in ((unknown, known), (known, unknown)):
+        comparison = compare_lsa_instances(first, second)
+        assert comparison.undecided is True
+        assert comparison.winner is None
+        assert "unresolved" in comparison.reason
+        assert "identical" not in comparison.reason
 
 
 def test_select_lsa_instance_folds_across_observers() -> None:
@@ -386,8 +397,13 @@ def test_same_instance_with_different_membership_is_flagged_inconsistent() -> No
         [_device("r1", [a]), _device("r2", [b])], warnings
     )
 
-    assert len(canonical) == 1
+    # One instance, two different bodies: no list may be chosen, so the LSA is
+    # withheld from reconstruction rather than guessed at.
+    assert canonical == []
+    assert any("membership disagreement" in w for w in warnings)
     assert any("inconsistent observation" in w for w in warnings)
+    # Both reports survive in the warning text.
+    assert any("10.255.255.3" in w for w in warnings)
 
 
 def test_formatting_differences_are_not_mistaken_for_a_version_conflict() -> None:
@@ -411,7 +427,8 @@ def test_formatting_differences_are_not_mistaken_for_a_version_conflict() -> Non
     canonical = canonical_network_lsas(
         [_device("r1", [a]), _device("r2", [b])], warnings
     )
-    assert len(canonical) == 1
+    # The memberships differ, so no list can be chosen.
+    assert canonical == []
     # One instance observed, so this is an inconsistent observation...
     assert any("inconsistent observation" in w for w in warnings)
     # ...not a version conflict.
@@ -567,3 +584,296 @@ def test_integration_cdp_links_unchanged_and_no_cable_from_ospf(lab) -> None:  #
     # OspfTopology has no link collection at all.
     assert not hasattr(lab, "links")
     assert "ospf" not in Topology.model_fields
+
+
+# =========================================================================== #
+# 5. Strict LS Age validation
+# =========================================================================== #
+
+from nettwin.collect.ospf_topology import (  # noqa: E402
+    is_valid_ls_age,
+    is_valid_ls_checksum,
+    lsa_content_fingerprint,
+    parse_ls_age,
+)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, True, False, 1418.7, 0.0, "1418", "", "abc", [1418], {"age": 1418}],
+    ids=["none", "true", "false", "float", "float0", "numeric-str", "empty",
+         "garbage", "list", "dict"],
+)
+def test_invalid_age_is_rejected(value: object) -> None:
+    """Non-integer, bool, float and string ages are not evidence."""
+    assert parse_ls_age(value) is None
+    assert is_valid_ls_age(value) is False
+
+
+@pytest.mark.parametrize("value", [-1, -5, 3601, 5000, 99999])
+def test_out_of_range_age_is_rejected(value: int) -> None:
+    """RFC 2328 §12.1.1: age is a unsigned seconds counter saturating at MaxAge."""
+    assert parse_ls_age(value) is None
+    assert is_valid_ls_age(value) is False
+
+
+@pytest.mark.parametrize("value", [0, 1, 100, 900, 1800, 3599, 3600])
+def test_boundary_ages_are_accepted(value: int) -> None:
+    assert parse_ls_age(value) == value
+    assert is_valid_ls_age(value) is True
+
+
+def test_age_is_never_clamped_into_range() -> None:
+    """5000 is malformed, not "MaxAge-ish"; clamping would invent a flush claim."""
+    assert parse_ls_age(5000) is None
+
+
+def test_none_vs_none_age_is_unresolved() -> None:
+    comparison = compare_lsa_instances(rlsa(age=None), rlsa(age=None))
+    assert comparison.undecided is True
+    assert comparison.winner is None
+
+
+def test_none_vs_valid_age_is_unresolved_in_both_directions() -> None:
+    unknown, known = rlsa(age=None), rlsa(age=100)
+    for first, second in ((unknown, known), (known, unknown)):
+        comparison = compare_lsa_instances(first, second)
+        assert comparison.undecided is True
+        assert comparison.winner is None
+        assert "unresolved" in comparison.reason
+
+
+def test_max_age_does_not_win_against_an_unknown_age() -> None:
+    """The specific regression: MaxAge vs None must not pick the MaxAge copy."""
+    max_age, unknown = rlsa(age=LS_AGE_MAX), rlsa(age=None)
+    for first, second in ((max_age, unknown), (unknown, max_age)):
+        comparison = compare_lsa_instances(first, second)
+        assert comparison.undecided is True
+        assert comparison.winner is None
+        assert "MaxAge instance wins" not in comparison.reason
+
+
+@pytest.mark.parametrize("bad_age", [-1, 3601, 5000], ids=["negative", "over", "far-over"])
+def test_negative_and_oversized_ages_are_unresolved(bad_age: int) -> None:
+    for first, second in ((rlsa(age=bad_age), rlsa(age=100)),
+                          (rlsa(age=100), rlsa(age=bad_age))):
+        comparison = compare_lsa_instances(first, second)
+        assert comparison.undecided is True
+        assert comparison.winner is None
+
+
+def test_sequence_and_checksum_precedence_survives_bad_age() -> None:
+    """Age is only consulted when sequence and checksum tie."""
+    newer = rlsa(sequence="0x80000005", age=None)
+    older = rlsa(sequence="0x80000004", age=100)
+    assert compare_lsa_instances(newer, older).winner is newer
+
+    higher_ck = rlsa(checksum="0x9999", age=None)
+    lower_ck = rlsa(checksum="0x1111", age=100)
+    assert compare_lsa_instances(higher_ck, lower_ck).winner is higher_ck
+
+
+def test_exact_max_age_diff_boundary_is_identical() -> None:
+    """900 == MaxAgeDiff is within tolerance; 901 is beyond it."""
+    a, b = rlsa(age=100), rlsa(age=100 + MAX_AGE_DIFF)
+    comparison = compare_lsa_instances(a, b)
+    assert comparison.undecided is False
+    assert "identical" in comparison.reason
+
+    c = rlsa(age=100 + MAX_AGE_DIFF + 1)
+    comparison = compare_lsa_instances(a, c)
+    assert comparison.winner is a
+    assert "younger" in comparison.reason
+
+
+def test_zero_and_max_age_boundaries_compare_correctly() -> None:
+    zero_age, max_age = rlsa(age=0), rlsa(age=LS_AGE_MAX)
+    comparison = compare_lsa_instances(zero_age, max_age)
+    assert comparison.winner is max_age          # MaxAge rule, not "younger"
+    assert parse_ls_age(0) == 0
+    assert parse_ls_age(LS_AGE_MAX) == LS_AGE_MAX
+
+
+# =========================================================================== #
+# 6. Deterministic multi-observer canonicalisation
+# =========================================================================== #
+
+_AGE_TO_OBSERVER = {100: "r1", 800: "r3", 1700: "r5"}
+
+
+def _copies_for(ages: list[int]) -> list[OspfRouterLsa]:
+    """One copy per age, with the observer bound to the age (identity is stable)."""
+    return [rlsa(age=age, device_id=_AGE_TO_OBSERVER[age]) for age in ages]
+
+
+def test_all_six_permutations_choose_the_same_canonical_instance() -> None:
+    """The regression: a sequential fold returned 100 or 800 depending on order.
+
+    With ages 100/800/1700 every pair is within MaxAgeDiff 900, so pairwise
+    §13.1 calls them all the same instance and the relation is not transitive.
+    Aggregation over the whole set must yield one answer for every order.
+    """
+    from itertools import permutations
+
+    results = []
+    for order in permutations([100, 800, 1700]):
+        selection = select_lsa_instance(_copies_for(list(order)))
+        assert selection.undecided is False
+        assert selection.winner is not None
+        results.append((selection.winner.age, selection.winner.device_id))
+
+    assert len(set(results)) == 1, f"order-dependent result: {results}"
+    assert results[0] == (100, "r1")
+
+
+def test_permutations_preserve_observer_provenance() -> None:
+    """Determinism must not be achieved by forgetting who reported what."""
+    from itertools import permutations
+
+    for order in permutations([100, 800, 1700]):
+        copies = _copies_for(list(order))
+        selection = select_lsa_instance(copies)
+        observers = {c.device_id for c in copies}
+        assert len(observers) == 3
+        # The chosen instance is one of the reported ones, not synthesised.
+        assert selection.winner in copies
+
+
+def test_age_spread_beyond_max_age_diff_selects_youngest_whatever_the_order() -> None:
+    from itertools import permutations
+
+    for order in permutations([100, 1700]):
+        selection = select_lsa_instance(_copies_for(list(order)))
+        assert selection.winner is not None
+        assert selection.winner.age == 100
+        assert "exceeds MaxAgeDiff" in selection.reason
+
+
+def test_content_disagreement_within_max_age_diff_is_unresolved() -> None:
+    """Same sequence/checksum, different body: never silently pick one."""
+    from nettwin.domain.ospf_models import OspfLinkType, OspfLsaLink
+
+    def with_metric(age: int, device_id: str, metric: int) -> OspfRouterLsa:
+        return rlsa(age=age, device_id=device_id).model_copy(
+            update={
+                "links": [
+                    OspfLsaLink(
+                        link_type=OspfLinkType.STUB,
+                        link_id="192.0.2.0",
+                        link_data="255.255.255.0",
+                        metric=metric,
+                    )
+                ]
+            }
+        )
+
+    first = with_metric(100, "r1", 10)
+    second = with_metric(800, "r2", 20)
+
+    selection = select_lsa_instance([first, second])
+    assert selection.undecided is True
+    assert selection.winner is None
+    assert "content differs" in selection.reason
+    assert "r1" in selection.reason and "r2" in selection.reason
+
+    # And through the canonical layer, nothing is published.
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [
+            OspfDeviceData(device_id="r1", router_lsas=[first]),
+            OspfDeviceData(device_id="r2", router_lsas=[second]),
+        ],
+        warnings,
+    )
+    assert canonical == []
+    assert any("could not be resolved" in w for w in warnings)
+
+
+def test_identical_content_with_different_ages_keeps_every_observer() -> None:
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    copies = [
+        rlsa(age=100, device_id="r1"),
+        rlsa(age=800, device_id="r3"),
+        rlsa(age=1700, device_id="r5"),
+    ]
+    devices = [
+        OspfDeviceData(device_id=c.device_id, router_lsas=[
+            c.model_copy(update={"link_state_id": "10.255.255.1",
+                                 "advertising_router": "10.255.255.1"})
+        ])
+        for c in copies
+    ]
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(devices, warnings)
+
+    assert len(canonical) == 1
+    assert canonical[0].observed_by == ["r1", "r3", "r5"]
+    assert canonical[0].age == 100
+
+
+def test_content_fingerprint_excludes_age_and_observer() -> None:
+    a = rlsa(age=100, device_id="r1")
+    b = rlsa(age=1700, device_id="r9")
+    assert lsa_content_fingerprint(a) == lsa_content_fingerprint(b)
+
+    n1 = nlsa(age=100, attached=["10.255.255.1"], device_id="r1")
+    n2 = nlsa(age=1700, attached=["10.255.255.1"], device_id="r2")
+    assert lsa_content_fingerprint(n1) == lsa_content_fingerprint(n2)
+
+    n3 = nlsa(age=100, attached=["10.255.255.1", "10.255.255.3"], device_id="r1")
+    assert lsa_content_fingerprint(n1) != lsa_content_fingerprint(n3)
+
+
+# =========================================================================== #
+# 7. Zero LS checksum rejection
+# =========================================================================== #
+
+
+def test_zero_checksum_is_invalid() -> None:
+    assert parse_ls_checksum("0x0000") is None
+    assert parse_ls_checksum("0") is None
+    assert parse_ls_checksum("0000") is None
+    assert is_valid_ls_checksum(0) is False
+
+
+@pytest.mark.parametrize("value", [1, 2, 0x5E6F, 0xFFFF])
+def test_valid_checksums_are_accepted(value: int) -> None:
+    assert is_valid_ls_checksum(value) is True
+
+
+@pytest.mark.parametrize("value", [65536, 0x10000, 0x123456, -1])
+def test_checksums_outside_16_bit_range_are_invalid(value: int) -> None:
+    assert is_valid_ls_checksum(value) is False
+
+
+def test_checksum_boundaries() -> None:
+    assert parse_ls_checksum("0x0001") == 1
+    assert parse_ls_checksum("0xFFFF") == 65535
+    assert parse_ls_checksum("0x10000") is None   # 65536
+
+
+def test_zero_checksum_cannot_decide_between_copies() -> None:
+    """Zero is malformed metadata, so it cannot act as the §13.1 tie-break."""
+    zero, one = rlsa(checksum="0x0000"), rlsa(checksum="0x0001")
+    for first, second in ((zero, one), (one, zero)):
+        comparison = compare_lsa_instances(first, second)
+        assert comparison.undecided is True
+        assert comparison.winner is None
+
+
+def test_zero_checksum_versus_zero_checksum_is_unresolved() -> None:
+    comparison = compare_lsa_instances(rlsa(checksum="0x0000"), rlsa(checksum="0x0000"))
+    assert comparison.undecided is True
+    assert comparison.winner is None
+
+
+@pytest.mark.parametrize("bad", ["", "zzz", "0x0000", "0x10000"], ids=["empty", "garbage", "zero", "over"])
+def test_missing_or_malformed_checksum_never_yields_a_fallback_winner(bad: str) -> None:
+    for first, second in ((rlsa(checksum=bad), rlsa(checksum="0x1234")),
+                          (rlsa(checksum="0x1234"), rlsa(checksum=bad))):
+        comparison = compare_lsa_instances(first, second)
+        assert comparison.undecided is True
+        assert comparison.winner is None
