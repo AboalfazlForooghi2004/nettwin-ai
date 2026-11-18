@@ -383,3 +383,112 @@ def test_single_observer_lsa_keeps_its_provenance_and_is_not_withheld() -> None:
     # fixture having no Network LSAs or neighbours are expected and not the
     # subject of this test.)
     assert not [w for w in topology.warnings if "conflict" in w.lower() or "unresolved" in w.lower()]
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1 (live-ospf-20261118-124403) — the five-observer Router LSA
+#
+# The raw evidence held 10.255.255.5 / 80000081 / 0x90FC in all five devices'
+# output, yet the canonical record showed observed_by=['r2-1']. These fixtures
+# reproduce the reported raw shape exactly, including the whitespace-only line
+# preceding the block in the four non-seed captures.
+# --------------------------------------------------------------------------- #
+
+LIVE_DIR = Path(__file__).parent / "data" / "ospf" / "live"
+LIVE_OBSERVERS = ["r2", "r2-1", "r2-2", "r2-3", "r2-4"]
+
+
+def _parse_live(device: str):  # noqa: ANN202
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    text = (LIVE_DIR / f"router_lsa_{device}.txt").read_text(encoding="utf-8")
+    return parse_show_ip_ospf_database_router(text, device)
+
+
+@pytest.mark.parametrize("device", LIVE_OBSERVERS)
+def test_live_raw_capture_parses_on_every_observer(device: str) -> None:
+    """Each of the five raw blocks must yield the LSA, before any aggregation."""
+    lsas, warnings = _parse_live(device)
+    assert len(lsas) == 1, f"{device}: {warnings}"
+    lsa = lsas[0]
+    assert lsa.link_state_id == "10.255.255.5"
+    assert lsa.advertising_router == "10.255.255.5"
+    assert lsa.sequence == "80000081"
+    assert lsa.checksum == "0x90FC"
+    assert len(lsa.links) == 3
+    # Observer identity is the collecting device, never the originator.
+    assert lsa.device_id == device
+
+
+@pytest.mark.parametrize("device", ["r2", "r2-2", "r2-3", "r2-4"])
+def test_leading_whitespace_line_does_not_swallow_the_block(device: str) -> None:
+    """The reported format clue: a whitespace-only line before the header."""
+    raw = (LIVE_DIR / f"router_lsa_{device}.txt").read_text(encoding="utf-8")
+    assert "\n        \n" in raw, "fixture must preserve the reported shape"
+    lsas, _ = _parse_live(device)
+    assert len(lsas) == 1
+
+
+def test_five_live_observers_canonicalise_to_one_router_lsa() -> None:
+    """Acceptance: one canonical LSA, 80000081/0x90FC, all five observers."""
+    from nettwin.collect.cisco_ios import DeviceObservations
+    from nettwin.collect.nested.discovery import ospf_device_data
+    from nettwin.collect.ospf_topology import build_ospf_topology
+
+    devices = []
+    for device in LIVE_OBSERVERS:
+        lsas, _ = _parse_live(device)
+        observations = DeviceObservations(
+            host="h", device_id=device, collected_at="", status="ok"
+        )
+        observations.ospf_router_lsas = [lsa.model_dump() for lsa in lsas]
+        devices.append(ospf_device_data(observations, device))
+
+    topology = build_ospf_topology(devices)
+    router_lsas = [
+        item for item in topology.router_lsas if item.link_state_id == "10.255.255.5"
+    ]
+    assert len(router_lsas) == 1
+    canonical = router_lsas[0]
+    assert canonical.sequence == "80000081"
+    assert canonical.checksum == "0x90FC"
+    assert canonical.observed_by == sorted(LIVE_OBSERVERS)
+    assert canonical.advertising_router == "10.255.255.5"
+    # No observation invented, none duplicated.
+    assert len(canonical.observed_by) == len(set(canonical.observed_by)) == 5
+
+
+def test_a_truncated_capture_is_reported_not_silently_lost() -> None:
+    """The observable symptom: an LSA present in the CLI but absent from results.
+
+    A capture cut short leaves fewer links than the LSA declares, so the object
+    is internally inconsistent and is withheld. That is correct — but it must
+    say so, or a dropped observation is indistinguishable from one that never
+    existed.
+    """
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    full = (LIVE_DIR / "router_lsa_r2-2.txt").read_text(encoding="utf-8")
+    truncated = full.split("    Link connected to: a Transit Network")[0]
+
+    lsas, warnings = parse_show_ip_ospf_database_router(truncated, "r2-2")
+    assert lsas == []
+    assert any("LSA dropped" in w for w in warnings)
+    assert any("truncated" in w for w in warnings), warnings
+    assert any("observer=r2-2" in w for w in warnings)
+
+
+def test_parse_warnings_are_persisted_in_the_evidence_artifact(writer) -> None:
+    """A dropped LSA must be visible in the artifact, not only in memory."""
+    from nettwin.collect.cisco_ios import DeviceObservations
+
+    observations = DeviceObservations(host="h", device_id="r2-2", collected_at="", status="ok")
+    observations.raw_commands = {"show ip ospf database router": "text"}
+    observations.warnings = [
+        "show ip ospf database router [observer=r2-2]: LSA 10.255.255.5 declares 3 "
+        "link(s) but 1 were parsed — LSA dropped (truncated)"
+    ]
+    evidence = writer._raw_evidence_audit(_Result([_Node("r2-2", observations)]))
+    device = evidence["devices"][0]
+    assert device["parse_warnings"]
+    assert any("LSA dropped" in w for w in device["parse_warnings"])

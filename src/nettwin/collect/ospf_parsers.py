@@ -281,7 +281,12 @@ def parse_show_ip_ospf_database(
 # show ip ospf database router  (Type 1 detail)
 # --------------------------------------------------------------------------- #
 
-_DETAIL_SPLIT_RE = re.compile(r"^\s*LS age:\s*(\d+)", re.IGNORECASE)
+#: An LSA block begins at its ``LS age:`` line. IOS varies the indent with the
+#: terminal and the code path (nested `ssh` in particular), and a capture may
+#: carry stray whitespace ahead of it, so the lead-in is matched loosely while
+#: the label itself stays exact. A line that merely *contains* "LS age:" mid
+#: sentence does not start a block.
+_DETAIL_SPLIT_RE = re.compile(r"^[\s\xa0]*LS\s+age\s*:\s*(\d+)", re.IGNORECASE)
 _KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 /()\-]*?):\s*(?P<value>.*?)\s*$")
 
 #: LSA header fields, extracted by dedicated patterns rather than the generic
@@ -620,9 +625,21 @@ def parse_show_ip_ospf_database_router(
             # — evidence that contradicts itself cannot decide which LSA instance
             # is current, and it would otherwise reach the fingerprint as a
             # contradictory pair of fields.
+            # Distinguish "the body was cut short" from "the count is wrong".
+            # The first is a capture problem and the operator can fix it by
+            # re-running; the second is a device or transcript defect. Both drop
+            # the LSA, but saying which one it was is the difference between a
+            # diagnosable run and a mysterious missing observation.
+            if len(lsa.links) < (lsa.number_of_links or 0):
+                hint = (
+                    " (the captured body is shorter than the LSA declares — the "
+                    "command output was probably truncated; re-collect this device)"
+                )
+            else:
+                hint = " (more links parsed than declared — transcript or parser defect)"
             warnings.append(
                 f"show ip ospf database router [{_observer_tag(device_id)}]: "
-                f"{mismatch} — LSA dropped"
+                f"{mismatch} — LSA dropped{hint}"
             )
             continue
         if not lsa.link_state_id:

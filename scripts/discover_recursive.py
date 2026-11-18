@@ -210,6 +210,12 @@ def _raw_evidence_audit(result) -> dict:  # noqa: ANN001 - RecursiveDiscoveryRes
             {
                 "device_id": observations.device_id or node.identity,
                 "identity": node.identity,
+                # Parser warnings belong here more than anywhere else: an
+                # "LSA dropped" line is the *only* record that an observation
+                # existed and was discarded. Without it a dropped LSA is
+                # indistinguishable from a device that never had it, which is
+                # precisely how five observations became one in the live run.
+                "parse_warnings": list(getattr(observations, "warnings", []) or []),
                 "commands": {
                     command: {
                         "bytes": len(text.encode("utf-8")),

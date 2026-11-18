@@ -193,9 +193,17 @@ def parse_ls_sequence(sequence: str) -> int | None:
 def is_valid_ls_sequence(value: int | None) -> bool:
     """Is ``value`` a sequence number an LSA may legitimately carry?
 
-    ``0x80000000`` is reserved, so ``-2147483648`` is not a valid instance.
+    RFC 2328 §12.1.6: ``InitialSequenceNumber`` is ``0x80000001`` (the first
+    value a router uses) and ``0x80000000`` is **reserved**, never carried by a
+    real LSA. A copy reporting the reserved value cannot be ordered against a
+    valid one — treating it as "extremely old" would let a malformed field
+    silently lose to anything, which is a fabricated conclusion.
+
+    The valid range is therefore the signed space ``-2147483647..2147483647``.
     """
-    return value is not None and value != -(1 << 31) and -2147483647 <= value <= 2147483647
+    if value is None:
+        return False
+    return value != -(1 << 31) and -(1 << 31) + 1 <= value <= (1 << 31) - 1
 
 
 def parse_ls_checksum(checksum: str) -> int | None:
@@ -376,12 +384,24 @@ def compare_lsa_instances(
 
     assert sequence_a is not None and sequence_b is not None  # narrowed above
     if sequence_a != sequence_b:
+        # Print the sequence the way the device does (unsigned 32-bit hex), not
+        # as the signed integer the comparison needs: "sequence -2147483518"
+        # cannot be matched against any CLI output, and the sign is an artefact
+        # of signed ordering rather than something an operator ever sees.
         if sequence_a > sequence_b:
             return LsaInstanceComparison(
-                winner=first, reason=f"higher LS sequence number ({sequence_a})"
+                winner=first,
+                reason=(
+                    "higher LS sequence number "
+                    f"0x{sequence_a & 0xFFFFFFFF:08X} (vs 0x{sequence_b & 0xFFFFFFFF:08X})"
+                ),
             )
         return LsaInstanceComparison(
-            winner=second, reason=f"higher LS sequence number ({sequence_b})"
+            winner=second,
+            reason=(
+                "higher LS sequence number "
+                f"0x{sequence_b & 0xFFFFFFFF:08X} (vs 0x{sequence_a & 0xFFFFFFFF:08X})"
+            ),
         )
 
     checksum_a = parse_ls_checksum(first.checksum)
@@ -643,7 +663,22 @@ def select_lsa_instance(
     best_checksum = max(value for value, _ in checked)
     candidates = [c for value, c in checked if value == best_checksum]
 
-    sequence_reason = f"sequence {best_sequence}, checksum 0x{best_checksum:04X}"
+    # Printed as the 32-bit hex the device shows, not as the signed integer the
+    # comparison uses: an operator reading "sequence -2147483518" cannot match it
+    # to the CLI output, and the sign is an artefact of signed ordering.
+    sequence_reason = (
+        f"sequence 0x{best_sequence & 0xFFFFFFFF:08X}, checksum 0x{best_checksum:04X}"
+    )
+
+    # How many copies agreed on the *winning instance*? This is the number that
+    # decides whether a stale copy exists. It must be captured here, because
+    # ``candidates`` is narrowed further below by the age rules — and the age
+    # rules describe how the *same instance* is rendered, not whether different
+    # instances exist. Conflating the two produced the live warning "every copy
+    # is the same instance" while one observer held an older sequence number.
+    agreeing = len(candidates)
+    stale = len(copies) - agreeing
+
     if len(candidates) == 1:
         return LsaInstanceComparison(
             winner=candidates[0], reason=f"highest {sequence_reason}"
@@ -689,9 +724,23 @@ def select_lsa_instance(
             return LsaInstanceComparison(winner=contenders[0], reason=reason)
         candidates = contenders
     else:
+        # Two facts, kept apart on purpose (RFC 2328 §13.1):
+        #   * the copies that reached here hold the *same instance* — their
+        #     sequence and checksum are equal, which is what "same instance"
+        #     means;
+        #   * an age spread within MaxAgeDiff means they are the same
+        #     *rendition* of that instance, so age cannot pick between them.
+        # Neither statement covers any observer that disagreed on sequence or
+        # checksum: those are stale copies of a *different* instance and are
+        # reported separately rather than folded into this sentence.
+        scope = (
+            f"all {agreeing} copies agree" if stale == 0
+            else f"the {agreeing} copies holding this instance agree"
+        )
         reason = (
             f"{reason}; ages {sorted(set(ages))} span {oldest - youngest}s, within "
-            f"MaxAgeDiff {MAX_AGE_DIFF}, so every copy is the same instance"
+            f"MaxAgeDiff {MAX_AGE_DIFF}; {scope} on sequence and checksum, and a "
+            "spread within MaxAgeDiff is the same rendition — age cannot separate them"
         )
 
     # --- 5. content -------------------------------------------------------- #
@@ -793,10 +842,33 @@ def canonical_router_lsas(
                 f"{c.device_id or '?'}={c.sequence or '?'}/{c.checksum or '?'}"
                 for c in sorted(copies, key=lambda c: c.device_id)
             )
+            # Name the stale copies explicitly. RFC 2328 §13.1 makes the highest
+            # sequence authoritative, so every other observer holds an instance
+            # that has been superseded — that is a *stale LSDB*, which is
+            # operationally different from "observers disagree", and the operator
+            # needs to see which device to go and look at.
+            winner_sequence = parse_ls_sequence(chosen.sequence)
+            stale = sorted(
+                (
+                    c
+                    for c in copies
+                    if parse_ls_sequence(c.sequence) != winner_sequence
+                ),
+                key=lambda c: c.device_id,
+            )
+            stale_note = ""
+            if stale:
+                stale_note = (
+                    "; stale copy from "
+                    + ", ".join(
+                        f"{c.device_id or '?'} (seq {c.sequence or '?'})" for c in stale
+                    )
+                    + " — superseded, kept as evidence, not treated as the same instance"
+                )
             warnings.append(
                 f"OSPF LSDB disagreement on {identity.describe()}: observers report "
                 f"different instances ({detail}); {selection.reason} was used and the "
-                "conflict is preserved here rather than resolved silently"
+                f"conflict is preserved here rather than resolved silently{stale_note}"
             )
             per_observer = [
                 {

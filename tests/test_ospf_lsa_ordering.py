@@ -1875,3 +1875,151 @@ def test_retention_selection_is_officially_filtered() -> None:
     assert "if command in OSPF_RAW_COMMANDS" in source, (
         "raw output must be filtered to OSPF commands, not copied wholesale"
     )
+
+
+# =========================================================================== #
+# 17. RFC 2328 §13.1 — instance identity vs rendition
+#
+# Live run live-ospf-20261118-124403 emitted "every copy is the same instance"
+# for an LSA where r2-1 held sequence 80000081 and the other four held 80000082.
+# The sequences differ, so they are *different instances*; the age rule that
+# said otherwise had been applied to the narrowed candidate set and its wording
+# generalised to all observers.
+# =========================================================================== #
+
+
+def _rlsa_seq(device: str, sequence: str, age: int | None, checksum: str = "0x90FC"):
+    return rlsa(
+        sequence=sequence, checksum=checksum, age=age, device_id=device,
+        link_state_id="10.255.255.3", advertising_router="10.255.255.3",
+    )
+
+
+def test_different_sequences_within_max_age_diff_are_not_the_same_instance() -> None:
+    """The reported defect, asserted directly on the comparator's wording."""
+    older = _rlsa_seq("r2-1", "80000081", 1161)
+    newer = _rlsa_seq("r2-2", "80000082", 1163)
+    assert abs(1163 - 1161) < MAX_AGE_DIFF
+
+    comparison = compare_lsa_instances(older, newer)
+    assert comparison.winner is newer
+    assert comparison.undecided is False
+    # It must attribute the choice to the sequence, and must not claim the two
+    # copies are one instance. ("same instance" appears in the *negation* of
+    # that claim, so assert on the affirmative form.)
+    assert "sequence" in comparison.reason.lower()
+    assert "0x80000082" in comparison.reason.lower()
+    assert "every copy is the same instance" not in comparison.reason
+
+
+def test_different_sequences_outside_max_age_diff_still_ordered_by_sequence() -> None:
+    """Sequence is compared first, so age cannot override it."""
+    older = _rlsa_seq("r2-1", "80000081", 100)
+    newer = _rlsa_seq("r2-2", "80000082", 3000)
+    assert 3000 - 100 > MAX_AGE_DIFF
+
+    comparison = compare_lsa_instances(older, newer)
+    assert comparison.winner is newer
+    assert "0x80000082" in comparison.reason.lower()
+    assert "every copy is the same instance" not in comparison.reason
+
+
+def test_same_sequence_different_checksums_ordered_by_checksum() -> None:
+    low = _rlsa_seq("r2-1", "80000082", 100, checksum="0x1234")
+    high = _rlsa_seq("r2-2", "80000082", 100, checksum="0xABCD")
+
+    comparison = compare_lsa_instances(low, high)
+    assert comparison.winner is high
+    assert "checksum" in comparison.reason.lower()
+
+
+def test_same_sequence_and_checksum_with_max_age_difference() -> None:
+    """A MaxAge copy wins when the rest agree on instance identity."""
+    live = _rlsa_seq("r2-1", "80000082", 100)
+    max_age = _rlsa_seq("r2-2", "80000082", LS_AGE_MAX)
+
+    comparison = compare_lsa_instances(live, max_age)
+    assert comparison.winner is max_age
+    assert "MaxAge" in comparison.reason
+
+
+def test_same_instance_within_max_age_diff_reports_rendition_not_identity() -> None:
+    """Same sequence and checksum, close ages — same *instance*, and it says so."""
+    a = _rlsa_seq("r2-1", "80000082", 1161)
+    b = _rlsa_seq("r2-2", "80000082", 1163)
+
+    comparison = compare_lsa_instances(a, b)
+    assert comparison.undecided is False
+    assert comparison.winner is not None
+    # The wording must scope its claim to the copies that actually agree.
+    assert "sequence and checksum" in comparison.reason
+    assert "every copy" not in comparison.reason or "agree" in comparison.reason
+
+
+def test_reserved_sequence_next_to_a_valid_one_is_undecided() -> None:
+    """RFC 2328 §12.1.6: ``0x80000000`` is reserved, so it cannot be ordered.
+
+    It must not act as an extremely old instance the way its signed magnitude
+    would suggest — a malformed field must never silently lose to anything.
+    """
+    reserved = _rlsa_seq("A", "80000000", 100)
+    valid = _rlsa_seq("B", "80000001", 100)
+    for pair in ((reserved, valid), (valid, reserved)):
+        comparison = compare_lsa_instances(*pair)
+        assert comparison.undecided is True
+        assert comparison.winner is None
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "expected"),
+    [
+        ("80000001", "80000002", "second"),
+        ("7FFFFFFE", "7FFFFFFF", "second"),
+        ("FFFFFFFE", "FFFFFFFF", "second"),
+        ("80000082", "80000081", "first"),
+        ("00000001", "FFFFFFFF", "first"),
+    ],
+    ids=["adjacent", "top-of-range", "near-wrap", "live-case", "wrap-vs-small"],
+)
+def test_signed_sequence_ordering(first: str, second: str, expected: str) -> None:
+    """Signed 32-bit ordering across the sign boundary.
+
+    ``0x80000001`` is ``InitialSequenceNumber`` and ``0x7FFFFFFF`` is the
+    newest; the sign is an artefact of interpreting the field as signed, which
+    is what makes ``0x7FFFFFFF`` compare *newer* than ``0x80000001``.
+    """
+    a = _rlsa_seq("A", first, 100)
+    b = _rlsa_seq("B", second, 100)
+    comparison = compare_lsa_instances(a, b)
+    winner = comparison.winner
+    assert winner is not None, comparison.reason
+    assert winner.device_id == ("A" if expected == "first" else "B"), comparison.reason
+
+
+def test_stale_copy_is_kept_as_provenance_not_discarded() -> None:
+    """The older observation stays in the record; it is not deleted."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    copies = [
+        _rlsa_seq("r2-1", "80000081", 1161),
+        *[_rlsa_seq(dev, "80000082", 1163) for dev in ("r2", "r2-2", "r2-3", "r2-4")],
+    ]
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [OspfDeviceData(device_id=c.device_id, router_lsas=[c]) for c in copies], warnings
+    )
+    assert len(canonical) == 1
+    winner = canonical[0]
+    assert winner.sequence == "80000082"
+    # Every observer is still accounted for, including the stale one.
+    assert winner.observed_by == ["r2", "r2-1", "r2-2", "r2-3", "r2-4"]
+    assert len(winner.observed_instances) == 5
+    stale_entries = [i for i in winner.observed_instances if i["sequence"] == "80000081"]
+    assert len(stale_entries) == 1
+    assert stale_entries[0]["observer"] == "r2-1"
+
+    # And the warning names the stale copy rather than claiming agreement.
+    joined = " ".join(warnings)
+    assert "every copy is the same instance" not in joined
+    assert "stale copy from r2-1" in joined
+    assert "superseded" in joined
