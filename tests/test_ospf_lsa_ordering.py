@@ -1657,3 +1657,221 @@ def test_options_normalisation_never_touches_the_model_field() -> None:
 
     network = _fingerprint_network(options="( Frobnicate , DC )")
     assert network.options == "( Frobnicate , DC )"
+
+
+# =========================================================================== #
+# 15. Live regression: live-ospf-20261118-092140
+#
+# Five routers were collected. Four reported no LS checksum for the same
+# Router LSA while one reported 0x8B65, so canonicalisation correctly refused
+# to pick a winner — the LSA was withheld and the run yielded 4 of 5 Router
+# LSAs. The refusal was right; the *evidence* was wrong. These tests pin the
+# whole path: the same header must parse identically on every observer, and a
+# genuinely missing field must still be withheld rather than filled in.
+# =========================================================================== #
+
+_LIVE_ROUTER_LSA = """Router Link States (Area 0)
+
+  LS age: 120
+  LS Type: Router Links
+  Link State ID: 10.255.255.2
+  Advertising Router: 10.255.255.2
+{header}
+  Number of Links: 1
+
+    Link connected to: a Transit Network
+     (Link ID) Designated Router address: 10.0.23.1
+     (Link Data) Router Interface address: 10.0.23.2
+      Number of MTID metrics: 0
+       TOS 0 Metrics: 10
+"""
+
+_LIVE_NETWORK_LSA = """Net Link States (Area 0)
+
+  LS age: 120
+  LS Type: Network Links
+  Link State ID: 10.0.34.2
+  Advertising Router: 10.255.255.5
+{header}
+  Network Mask: /30
+        Attached Router: 10.255.255.3
+        Attached Router: 10.255.255.5
+"""
+
+
+def _parse_all_observers(fixture: str, header: str, parser: str) -> list:
+    from nettwin.collect import ospf_parsers as P
+
+    body = fixture.replace("{header}", header)
+    fn = (
+        P.parse_show_ip_ospf_database_router
+        if parser == "router"
+        else P.parse_show_ip_ospf_database_network
+    )
+    return [fn(body, f"r{i}-1")[0][0] for i in range(1, 6)]
+
+
+@pytest.mark.parametrize(
+    ("label", "header"),
+    [
+        ("separate", "  LS Seq Number: 8000007D\n  Checksum: 0x8B65"),
+        ("same-line", "  LS Seq Number: 8000007D        Checksum: 0x8B65"),
+        ("wrapped", "  LS Seq Number: 8000007D\n  Checksum:\n  0x8B65"),
+    ],
+    ids=["separate", "same-line", "wrapped"],
+)
+def test_live_header_variants_canonicalise_to_one_router_lsa(label: str, header: str) -> None:
+    """The live failure: five observers of one LSA must yield exactly one LSA."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    copies = _parse_all_observers(_LIVE_ROUTER_LSA, header, "router")
+    assert all(c.sequence == "8000007D" for c in copies), label
+    assert all(c.checksum == "0x8B65" for c in copies), label
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [OspfDeviceData(device_id=f"r{i}-1", router_lsas=[c]) for i, c in enumerate(copies, 1)],
+        warnings,
+    )
+    assert len(canonical) == 1, f"{label}: expected one canonical LSA, got {len(canonical)}"
+    assert canonical[0].checksum == "0x8B65"
+    assert canonical[0].sequence == "8000007D"
+    assert canonical[0].observed_by == ["r1-1", "r2-1", "r3-1", "r4-1", "r5-1"]
+    assert warnings == []
+
+
+def test_live_network_lsa_with_same_line_header_canonicalises() -> None:
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_network_lsas
+
+    copies = _parse_all_observers(
+        _LIVE_NETWORK_LSA, "  LS Seq Number: 80000077        Checksum: 0x3933", "network"
+    )
+    warnings: list[str] = []
+    canonical = canonical_network_lsas(
+        [OspfDeviceData(device_id=f"r{i}-1", network_lsas=[c]) for i, c in enumerate(copies, 1)],
+        warnings,
+    )
+    assert len(canonical) == 1
+    assert canonical[0].checksum == "0x3933"
+    assert canonical[0].observed_by == ["r1-1", "r2-1", "r3-1", "r4-1", "r5-1"]
+
+
+def test_a_truly_missing_checksum_is_still_withheld_not_invented() -> None:
+    """The fix must not weaken the rule it exposed.
+
+    If an observer genuinely printed no checksum, the LSA stays unresolved —
+    no winner, no fabricated value. Only the *parser* limitation is fixed.
+    """
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    good = _parse_all_observers(_LIVE_ROUTER_LSA, "  LS Seq Number: 8000007D\n  Checksum: 0x8B65", "router")
+    partial = _parse_all_observers(_LIVE_ROUTER_LSA, "  LS Seq Number: 8000007D", "router")
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [
+            OspfDeviceData(device_id="r1-1", router_lsas=[good[0]]),
+            OspfDeviceData(device_id="r2-1", router_lsas=[partial[0]]),
+        ],
+        warnings,
+    )
+    assert canonical == [], "an incomplete copy must not be resolved into a winner"
+    assert any("could not be resolved" in w for w in warnings)
+
+
+def test_complete_observation_survives_incomplete_peers() -> None:
+    """A complete copy is chosen on sequence; incompleteness never wins."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    older_complete = _parse_all_observers(_LIVE_ROUTER_LSA, "  LS Seq Number: 8000007C\n  Checksum: 0x1111", "router")[0]
+    newer_partial = _parse_all_observers(_LIVE_ROUTER_LSA, "  LS Seq Number: 8000007E", "router")[0]
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [
+            OspfDeviceData(device_id="r2-1", router_lsas=[older_complete]),
+            OspfDeviceData(device_id="r5-1", router_lsas=[newer_partial]),
+        ],
+        warnings,
+    )
+    # Higher sequence exists but its checksum is missing, so RFC 2328 §13.1
+    # cannot order it: nothing is claimed rather than guessing.
+    assert canonical == []
+
+# =========================================================================== #
+# 16. Raw evidence retention — scope, safety, serialization
+# =========================================================================== #
+
+
+def test_ospf_raw_commands_are_a_subset_of_the_read_only_allowlist() -> None:
+    """Retention may never widen what the collector is allowed to run."""
+    from nettwin.collect.cisco_ios import OSPF_RAW_COMMANDS, READ_ONLY_COMMANDS
+
+    assert OSPF_RAW_COMMANDS <= READ_ONLY_COMMANDS
+
+
+def test_credential_bearing_commands_are_never_retained() -> None:
+    """``show ip ospf interface`` can print authentication material.
+
+    It is excluded from the allowlist, and therefore cannot be retained:
+    exclusion is structural, not a filter over captured text.
+    """
+    from nettwin.collect.cisco_ios import OSPF_RAW_COMMANDS, READ_ONLY_COMMANDS
+
+    assert "show ip ospf interface" not in READ_ONLY_COMMANDS
+    assert "show ip ospf interface" not in OSPF_RAW_COMMANDS
+    # The brief variant carries no authentication material and is retained.
+    assert "show ip ospf interface brief" in OSPF_RAW_COMMANDS
+
+
+def test_non_ospf_commands_are_not_retained() -> None:
+    """Retention is scoped to OSPF: no version/route/CDP transcripts."""
+    from nettwin.collect.cisco_ios import OSPF_RAW_COMMANDS
+
+    for command in (
+        "show version",
+        "show ip interface brief",
+        "show ip route",
+        "show cdp neighbors",
+        "show cdp neighbors detail",
+    ):
+        assert command not in OSPF_RAW_COMMANDS, command
+
+
+def test_raw_commands_default_to_empty_and_are_backward_compatible() -> None:
+    """An observation built without the new field behaves exactly as before."""
+    from nettwin.collect.cisco_ios import DeviceObservations
+
+    observations = DeviceObservations(host="10.0.0.1", device_id="r1", collected_at="", status="ok")
+    assert observations.raw_commands == {}
+    assert observations.to_dict()["raw_commands"] == {}
+    # Every pre-existing field still present.
+    for field in ("host", "device_id", "collected_at", "status", "interfaces", "routes",
+                  "ospf_neighbors", "ospf_router_lsas", "ospf_network_lsas", "warnings"):
+        assert field in observations.to_dict(), field
+
+
+def test_raw_commands_serialize_as_plain_strings() -> None:
+    """The artifact stays YAML/JSON-serializable — no models, no dataclasses."""
+    import json
+
+    from nettwin.collect.cisco_ios import OSPF_RAW_COMMANDS, DeviceObservations
+
+    observations = DeviceObservations(host="10.0.0.1", device_id="r1", collected_at="", status="ok")
+    observations.raw_commands = {cmd: "text" for cmd in OSPF_RAW_COMMANDS}
+    serialized = json.dumps(observations.to_dict())
+    assert '"raw_commands"' in serialized
+    restored = json.loads(serialized)
+    assert set(restored["raw_commands"]) == set(OSPF_RAW_COMMANDS)
+
+
+def test_retention_selection_is_officially_filtered() -> None:
+    """The nested path filters to OSPF, so non-OSPF text never lands in it."""
+    import inspect
+
+    from nettwin.collect.nested import discovery
+
+    source = inspect.getsource(discovery)
+    assert "if command in OSPF_RAW_COMMANDS" in source, (
+        "raw output must be filtered to OSPF commands, not copied wholesale"
+    )

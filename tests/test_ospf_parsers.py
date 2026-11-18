@@ -651,3 +651,168 @@ def test_network_lsa_dr_addresses_match_summary_lsdb() -> None:
     }
     detail_net = {(n.link_state_id, n.advertising_router) for n in networks}
     assert summary_net == detail_net
+
+
+# =========================================================================== #
+# Regression: IOS prints LSA header fields in several layouts
+#
+# Live run live-ospf-20261118-092140: four of five routers reported no LS
+# checksum for the same LSA while the fifth reported 0x8B65. The cause was the
+# parser, not the devices: a generic greedy key/value match both swallowed a
+# second field on the same line and lost a value wrapped onto the next line.
+# =========================================================================== #
+
+_ROUTER_HEADER_TEMPLATE = """Router Link States (Area 0)
+
+  LS age: 100
+  LS Type: Router Links
+  Link State ID: 10.255.255.2
+  Advertising Router: 10.255.255.2
+{header}
+  Number of Links: 0
+"""
+
+_NETWORK_HEADER_TEMPLATE = """Net Link States (Area 0)
+
+  LS age: 100
+  LS Type: Network Links
+  Link State ID: 10.0.23.1
+  Advertising Router: 10.255.255.2
+{header}
+  Network Mask: /30
+        Attached Router: 10.255.255.2
+        Attached Router: 10.255.255.3
+"""
+
+
+@pytest.mark.parametrize(
+    ("label", "header"),
+    [
+        ("separate lines", "  LS Seq Number: 8000007D\n  Checksum: 0x8B65"),
+        ("both on one line", "  LS Seq Number: 8000007D        Checksum: 0x8B65"),
+        ("value wrapped", "  LS Seq Number: 8000007D\n  Checksum:\n  0x8B65"),
+        ("extra padding", "  LS Seq Number:   8000007D\n  Checksum:   0x8B65"),
+    ],
+    ids=["separate", "same-line", "wrapped", "padded"],
+)
+def test_router_lsa_header_layouts_all_yield_sequence_and_checksum(
+    label: str, header: str
+) -> None:
+    """Every layout IOS uses must yield *both* fields — never a corrupt value."""
+    lsas, _ = P.parse_show_ip_ospf_database_router(
+        _ROUTER_HEADER_TEMPLATE.replace("{header}", header), "r3-1"
+    )
+    assert len(lsas) == 1
+    lsa = lsas[0]
+    assert lsa.sequence == "8000007D", label
+    assert lsa.checksum == "0x8B65", label
+
+
+@pytest.mark.parametrize(
+    ("label", "header"),
+    [
+        ("separate lines", "  LS Seq Number: 80000078\n  Checksum: 0xAECE"),
+        ("both on one line", "  LS Seq Number: 80000078        Checksum: 0xAECE"),
+        ("value wrapped", "  LS Seq Number: 80000078\n  Checksum:\n  0xAECE"),
+    ],
+    ids=["separate", "same-line", "wrapped"],
+)
+def test_network_lsa_header_layouts_all_yield_sequence_and_checksum(
+    label: str, header: str
+) -> None:
+    lsas, _ = P.parse_show_ip_ospf_database_network(
+        _NETWORK_HEADER_TEMPLATE.replace("{header}", header), "r3-1"
+    )
+    assert len(lsas) == 1
+    lsa = lsas[0]
+    assert lsa.sequence == "80000078", label
+    assert lsa.checksum == "0xAECE", label
+
+
+def test_sequence_is_never_contaminated_by_the_next_field() -> None:
+    """The corruption bug: the value used to absorb the rest of the line."""
+    text = _ROUTER_HEADER_TEMPLATE.replace(
+        "{header}", "  LS Seq Number: 8000007D        Checksum: 0x8B65"
+    )
+    lsas, _ = P.parse_show_ip_ospf_database_router(text, "r3-1")
+    sequence = lsas[0].sequence
+    assert sequence == "8000007D"
+    assert "Checksum" not in sequence
+    assert " " not in sequence
+
+
+def test_genuinely_absent_checksum_stays_absent() -> None:
+    """The fix must not fabricate: a missing field stays missing."""
+    text = _ROUTER_HEADER_TEMPLATE.replace("{header}", "  LS Seq Number: 8000007D")
+    lsas, _ = P.parse_show_ip_ospf_database_router(text, "r3-1")
+    assert lsas[0].sequence == "8000007D"
+    assert lsas[0].checksum == ""
+
+
+def test_wrapped_value_does_not_swallow_a_real_header_line() -> None:
+    """A following header line must never be mistaken for a wrapped value."""
+    text = _ROUTER_HEADER_TEMPLATE.replace(
+        "{header}", "  LS Seq Number: 8000007D\n  Checksum:\n  Number of Links: 0"
+    )
+    lsas, _ = P.parse_show_ip_ospf_database_router(text, "r3-1")
+    assert lsas[0].checksum == ""
+    assert lsas[0].sequence == "8000007D"
+
+
+# =========================================================================== #
+# Malformed header values must degrade to "absent", never to "truncated"
+#
+# A truncated value is worse than a missing one: the caller can detect absence,
+# but cannot distinguish 8000007D (valid) from the first eight digits of
+# 8000007DAA (invalid). Encoding a prefix of a malformed value would let an
+# invalid observation decide RFC 2328 §13.1 ordering.
+# =========================================================================== #
+
+
+@pytest.mark.parametrize(
+    ("label", "header", "expected_seq", "expected_cksum"),
+    [
+        ("valid-same-line", "  LS Seq Number: 8000007D   Checksum: 0x8B65", "8000007D", "0x8B65"),
+        ("valid-separate", "  LS Seq Number: 8000007D\n  Checksum: 0x8B65", "8000007D", "0x8B65"),
+        ("valid-wrapped", "  LS Seq Number: 8000007D\n  Checksum:\n  0x8B65", "8000007D", "0x8B65"),
+        ("checksum-16bit", "  LS Seq Number: 8000007D\n  Checksum: 0xFFFF", "8000007D", "0xFFFF"),
+        ("checksum-no-0x", "  LS Seq Number: 8000007D\n  Checksum: 8B65", "8000007D", "8B65"),
+        ("seq-10-hex-digits", "  LS Seq Number: 8000007DAA\n  Checksum: 0x8B65", "", "0x8B65"),
+        ("cksum-5-hex-digits", "  LS Seq Number: 8000007D\n  Checksum: 0x8B651", "8000007D", ""),
+        ("cksum-0x-zzzz", "  LS Seq Number: ZZZZ\n  Checksum: 0xZZZZ", "", ""),
+        ("cksum-bare-0x", "  LS Seq Number: 8000007D\n  Checksum: 0x", "8000007D", ""),
+        ("seq-absent", "  Checksum: 0x8B65", "", "0x8B65"),
+        ("cksum-absent", "  LS Seq Number: 8000007D", "8000007D", ""),
+        ("continuation-is-field", "  LS Seq Number: 8000007D\n  Checksum:\n  Number of Links: 0", "8000007D", ""),
+    ],
+    ids=lambda v: v if isinstance(v, str) and " " not in v else "",
+)
+def test_header_values_are_never_truncated(
+    label: str, header: str, expected_seq: str, expected_cksum: str
+) -> None:
+    lsas, _ = P.parse_show_ip_ospf_database_router(
+        _ROUTER_HEADER_TEMPLATE.replace("{header}", header), "r9-1"
+    )
+    lsa = lsas[0]
+    assert lsa.sequence == expected_seq, label
+    assert lsa.checksum == expected_cksum, label
+
+
+def test_truncated_sequence_is_not_a_usable_sequence() -> None:
+    """End to end: the malformed value cannot decide an instance ordering."""
+    from nettwin.collect.ospf_topology import parse_ls_sequence
+
+    lsas, _ = P.parse_show_ip_ospf_database_router(
+        _ROUTER_HEADER_TEMPLATE.replace("{header}", "  LS Seq Number: 8000007DAA"), "r9-1"
+    )
+    assert parse_ls_sequence(lsas[0].sequence) is None
+
+
+def test_malformed_checksum_cannot_become_a_valid_checksum() -> None:
+    from nettwin.collect.ospf_topology import parse_ls_checksum
+
+    lsas, _ = P.parse_show_ip_ospf_database_router(
+        _ROUTER_HEADER_TEMPLATE.replace("{header}", "  LS Seq Number: 8000007D\n  Checksum: 0x8B651"),
+        "r9-1",
+    )
+    assert parse_ls_checksum(lsas[0].checksum) is None

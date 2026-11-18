@@ -3,6 +3,7 @@
 from nettwin.collect.cisco_ios import (
     DEFAULT_COMMANDS,
     OPTIONAL_COMMANDS,
+    OSPF_RAW_COMMANDS,
     READ_ONLY_COMMANDS,
     AllowlistViolation,
     CiscoIOSCollector,
@@ -30,6 +31,7 @@ from nettwin.collect.ios_parsers import (
 __all__ = [
     "DEFAULT_COMMANDS",
     "OPTIONAL_COMMANDS",
+    "OSPF_RAW_COMMANDS",
     "READ_ONLY_COMMANDS",
     "AllowlistViolation",
     "CdpNeighbor",

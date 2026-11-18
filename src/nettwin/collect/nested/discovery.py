@@ -38,6 +38,7 @@ from nettwin.collect import ospf_parsers
 from nettwin.collect.cisco_ios import (
     DEFAULT_COMMANDS,
     OPTIONAL_COMMANDS,
+    OSPF_RAW_COMMANDS,
     READ_ONLY_COMMANDS,
     CollectorError,
     DeviceObservations,
@@ -601,6 +602,16 @@ class RecursiveDiscovery:
                         f"{command}: {failure_summary(str(exc))}"
                     )
             observations = self._observations_from(node, session, collected)
+            # Retain the raw OSPF evidence so a parse defect remains
+            # diagnosable after the run. Parsed models record what we
+            # concluded; this records what the device printed. Filtered to
+            # OSPF_RAW_COMMANDS: the non-OSPF transcripts are irrelevant to an
+            # OSPF diagnosis and would only bloat the artifact.
+            observations.raw_commands = {
+                command: text
+                for command, text in collected.items()
+                if command in OSPF_RAW_COMMANDS
+            }
         except Exception:
             session.close()
             raise

@@ -283,6 +283,96 @@ def parse_show_ip_ospf_database(
 
 _DETAIL_SPLIT_RE = re.compile(r"^\s*LS age:\s*(\d+)", re.IGNORECASE)
 _KEY_VALUE_RE = re.compile(r"^\s*(?P<key>[A-Za-z][A-Za-z0-9 /()\-]*?):\s*(?P<value>.*?)\s*$")
+
+#: LSA header fields, extracted by dedicated patterns rather than the generic
+#: key/value split.
+#:
+#: The generic regex is greedy to end-of-line, which is wrong for two IOS
+#: layouts that really occur:
+#:
+#: * **Two header fields on one line.** Some IOS versions and terminal widths
+#:   print ``LS Seq Number: 8000007D   Checksum: 0x8B65`` on a single line. The
+#:   generic match swallowed the whole remainder as the *sequence number*,
+#:   leaving the checksum empty — a corrupt value, worse than a missing one,
+#:   because it makes the sequence unparseable and forces ``undecided``.
+#: * **A field wrapped onto the next line.** ``Checksum:`` with its value on the
+#:   following line matched with an empty value, so the checksum was silently
+#:   lost for that observer only.
+#:
+#: These patterns take only the field that belongs to them and tolerate the
+#: next field following on the same line.
+#:
+#: Both patterns end at a **token boundary** rather than matching a prefix, so a
+#: malformed value is refused instead of silently truncated. Encoding
+#: ``8000007DAA`` (ten hex digits — not a valid sequence) as ``8000007D`` would
+#: turn an invalid observation into a plausible one, which is worse than having
+#: no value at all: the caller can detect "absent", not "wrong".
+_HEX_SEQ_RE = re.compile(
+    r"LS\s+Seq(?:uence)?\s+Number\s*:\s*(?P<seq>0x[0-9A-Fa-f]+|[0-9A-Fa-f]{8})(?![0-9A-Fa-f])",
+    re.IGNORECASE,
+)
+#: An LS checksum is 16 bits, so at most four hex digits (RFC 2328 §A.4.1).
+#:
+#: The ``0x`` prefix is bound to at least one digit so a malformed
+#: ``0x8B651`` cannot match as a bare ``0x``. Failing to match is the desired
+#: outcome: the field then reads as absent, which the caller can detect, rather
+#: than as a truncated value it cannot.
+_HEX_CHECKSUM_RE = re.compile(
+    r"Checksum\s*:\s*(?P<cksum>(?:0x)?[0-9A-Fa-f]{1,4})(?![0-9A-Fa-fx])",
+    re.IGNORECASE,
+)
+#: A bare ``x`` or a hex run longer than four digits means the value is
+#: malformed. Rejecting the whole line is deliberate: reading ``0x8B651`` as
+#: ``0x`` would hand the caller a truncated value it has no way to distrust.
+_BAD_CHECKSUM_RE = re.compile(
+    r"Checksum\s*:\s*(?:[0-9A-Fa-f]{5,}|0x[0-9A-Fa-f]*[G-Zg-z])", re.IGNORECASE
+)
+_V4_ADDR_RE = re.compile(r"(?P<addr>\d{1,3}(?:\.\d{1,3}){3})")
+
+
+def _lsa_header_fields(stripped: str) -> dict[str, str]:
+    """Extract whichever LSA header fields this line carries.
+
+    A single line may legitimately carry more than one field, so this returns a
+    dict rather than a single key/value pair. Empty values are never returned:
+    a field whose value did not arrive is *absent*, which the models already
+    represent as ``""`` — the same thing a missing line yields. Nothing is
+    fabricated to fill the gap.
+    """
+    found: dict[str, str] = {}
+    seq = _HEX_SEQ_RE.search(stripped)
+    if seq:
+        found["sequence"] = seq.group("seq")
+    if _BAD_CHECKSUM_RE.search(stripped):
+        return found          # malformed checksum: report it as absent
+    cksum = _HEX_CHECKSUM_RE.search(stripped)
+    if cksum:
+        found["checksum"] = cksum.group("cksum")
+    return found
+
+
+def _wrapped_value_needed(lines: list[str], index: int) -> str | None:
+    """Return the continuation value when a header field wrapped its value.
+
+    IOS wraps long header lines at the terminal width. When that happens the
+    value lands on the following line on its own, e.g.::
+
+        Checksum:
+        0x8B65
+
+    Only a line that is *entirely* a plausible value is treated as a
+    continuation, so a real header line is never misread as one.
+    """
+    for following in lines[index + 1 : index + 3]:
+        candidate = following.strip()
+        if not candidate:
+            continue
+        # A continuation must be *exactly* one value: no trailing junk, and no
+        # longer hex run that would make it a malformed sequence/checksum.
+        if re.fullmatch(r"0x[0-9A-Fa-f]{1,4}|[0-9A-Fa-f]{1,4}", candidate):
+            return candidate
+        return None
+    return None
 _LINK_CONNECTED_RE = re.compile(
     r"^\s*Link connected to:\s*(?P<kind>.*?)\s*$", re.IGNORECASE
 )
@@ -414,7 +504,8 @@ def parse_show_ip_ospf_database_router(
             command="show ip ospf database router",
         )
 
-    for raw in text.splitlines():
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
         line = raw.rstrip()
         stripped = line.strip()
         if not stripped:
@@ -484,6 +575,20 @@ def parse_show_ip_ospf_database_router(
                 builder.current["mtid"] = mtid_match.group("mtid")
                 continue
 
+        # Header fields first: a line may carry more than one, and a field's
+        # value may have wrapped onto the next line.
+        header = _lsa_header_fields(stripped)
+        if header.get("sequence"):
+            builder.lsa.sequence = header["sequence"]
+        if header.get("checksum"):
+            builder.lsa.checksum = header["checksum"]
+        elif "checksum:" in stripped.lower() and not header.get("checksum"):
+            # "Checksum:" with the value on the following line (IOS wraps long
+            # header lines). Only a standalone value line is accepted.
+            wrapped = _wrapped_value_needed(lines, index)
+            if wrapped is not None:
+                builder.lsa.checksum = wrapped
+
         kv = _KEY_VALUE_RE.match(stripped)
         if kv:
             key = kv.group("key").strip().lower()
@@ -492,10 +597,6 @@ def parse_show_ip_ospf_database_router(
                 builder.lsa.link_state_id = value
             elif key == "advertising router":
                 builder.lsa.advertising_router = value
-            elif key == "ls seq number":
-                builder.lsa.sequence = value
-            elif key == "checksum":
-                builder.lsa.checksum = value
             elif key == "number of links":
                 builder.lsa.number_of_links = _to_int(value)
             elif key == "options":
@@ -581,7 +682,8 @@ def parse_show_ip_ospf_database_network(
         lsas.append(current)
         current = None
 
-    for raw in text.splitlines():
+    lines = text.splitlines()
+    for index, raw in enumerate(lines):
         line = raw.strip()
         if not line:
             continue
@@ -626,16 +728,24 @@ def parse_show_ip_ospf_database_network(
         if dr_match:
             current.link_state_id = dr_match.group("addr")
             continue
+        # Same header-field handling as the Router LSA parser: one line may
+        # carry two fields, and IOS may wrap a value onto the following line.
+        header = _lsa_header_fields(line)
+        if header.get("sequence"):
+            current.sequence = header["sequence"]
+        if header.get("checksum"):
+            current.checksum = header["checksum"]
+        elif "checksum:" in line.lower() and not header.get("checksum"):
+            wrapped = _wrapped_value_needed(lines, index)
+            if wrapped is not None:
+                current.checksum = wrapped
+
         kv = _KEY_VALUE_RE.match(line)
         if kv:
             key = kv.group("key").strip().lower()
             value = kv.group("value").strip()
             if key == "advertising router":
                 current.advertising_router = value
-            elif key == "ls seq number":
-                current.sequence = value
-            elif key == "checksum":
-                current.checksum = value
             elif key == "options":
                 current.options = value
             elif key == "length":

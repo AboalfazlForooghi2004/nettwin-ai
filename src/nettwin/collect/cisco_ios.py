@@ -84,6 +84,23 @@ DEFAULT_COMMANDS: tuple[str, ...] = (
     "show ip ospf route",
 )
 
+#: Commands whose raw text is worth retaining as diagnostic evidence.
+#:
+#: Only the OSPF set: an OSPF parse defect is diagnosable only from the OSPF
+#: transcript, and retaining the other six transcripts would multiply artifact
+#: size for no diagnostic gain. Every entry is read-only, and the command that
+#: can print authentication material (``show ip ospf interface``) is absent.
+OSPF_RAW_COMMANDS: frozenset[str] = frozenset(
+    {
+        "show ip ospf neighbor",
+        "show ip ospf interface brief",
+        "show ip ospf database",
+        "show ip ospf database router",
+        "show ip ospf database network",
+        "show ip ospf route",
+    }
+)
+
 #: Commands whose failure must never cost us the rest of a device's evidence.
 #: A router with no OSPF configured answers these with an error, a timeout, or
 #: nothing at all — that is a normal, expected condition, not a collection
@@ -286,6 +303,25 @@ class DeviceObservations:
     ospf_routes: list[dict[str, Any]] = field(default_factory=list)
     #: ``(process_id, router_id)`` from the OSPF output header.
     ospf_context: dict[str, str] = field(default_factory=dict)
+    #: Raw output of the **OSPF** commands only, kept as evidence.
+    #:
+    #: Without this a parse defect is undiagnosable after the fact: a live run
+    #: showed four of five routers reporting no LS checksum while the fifth did,
+    #: and *why* could not be determined because the CLI text had been parsed
+    #: and discarded. The parsed models say what we concluded; this says what
+    #: the device actually printed, which is the only way to tell an IOS
+    #: rendering difference from a parser bug.
+    #:
+    #: Scope is deliberately narrow. Every command here is already inside
+    #: ``READ_ONLY_COMMANDS`` and ``show ip ospf interface`` (which can print
+    #: authentication material) is not — but holding eleven full transcripts per
+    #: device would still bloat a run artifact, and none of the non-OSPF text is
+    #: needed to diagnose an OSPF parse. ``OSPF_RAW_COMMANDS`` defines the set;
+    #: credential-bearing commands are excluded by construction, not by filtering.
+    #:
+    #: Included in ``to_dict()`` (which is a plain ``asdict``), so anything
+    #: persisted through it carries this evidence too.
+    raw_commands: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
