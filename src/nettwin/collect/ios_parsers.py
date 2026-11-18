@@ -11,6 +11,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+from nettwin.collect.cli_text import normalise_cli_text
+
 # --------------------------------------------------------------------------- #
 # Parsed record types
 # --------------------------------------------------------------------------- #
@@ -146,6 +148,7 @@ _UPTIME_RE = re.compile(r"^(.+?)\s+uptime is\s", re.MULTILINE)
 
 def parse_show_version(text: str) -> tuple[ParsedVersion, list[str]]:
     """Extract hostname, IOS version and platform model from ``show version``."""
+    text = normalise_cli_text(text)   # parse a copy; raw evidence untouched
     warnings: list[str] = []
     parsed = ParsedVersion()
     uptime = _UPTIME_RE.search(text)
@@ -205,6 +208,7 @@ def _resolve_platform(text: str, model: str | None, warnings: list[str]) -> str 
 
 def parse_show_ip_interface_brief(text: str) -> tuple[list[InterfaceBrief], list[str]]:
     """Parse ``show ip interface brief`` rows (deterministic, fixed columns)."""
+    text = normalise_cli_text(text)   # parse a copy; raw evidence untouched
     interfaces: list[InterfaceBrief] = []
     warnings: list[str] = []
     for raw in text.splitlines():
@@ -289,6 +293,7 @@ _SKIP_LINE_RE = re.compile(
 
 def parse_show_ip_route(text: str) -> tuple[list[ParsedRoute], list[str]]:
     """Parse the IOS routing table, preserving every next hop of ECMP entries."""
+    text = normalise_cli_text(text)   # parse a copy; raw evidence untouched
     routes: list[ParsedRoute] = []
     warnings: list[str] = []
     current: ParsedRoute | None = None
@@ -398,6 +403,7 @@ _OSPF_HEADER_TOKENS = {"neighbor", "id", "pri", "state", "dead", "time", "addres
 
 def parse_show_ip_ospf_neighbor(text: str) -> tuple[list[OspfNeighbor], list[str]]:
     """Parse ``show ip ospf neighbor`` rows (one neighbor per row)."""
+    text = normalise_cli_text(text)   # parse a copy; raw evidence untouched
     neighbors: list[OspfNeighbor] = []
     warnings: list[str] = []
     for raw in text.splitlines():
@@ -511,6 +517,7 @@ def _cdp_capability_to_platform(mid: str) -> tuple[str, str]:
 
 def parse_show_cdp_neighbors(text: str) -> tuple[list[CdpNeighbor], list[str]]:
     """Parse ``show cdp neighbors`` rows using the header's column offsets."""
+    text = normalise_cli_text(text)   # parse a copy; raw evidence untouched
     neighbors: list[CdpNeighbor] = []
     warnings: list[str] = []
     columns: _CdpColumns | None = None
@@ -654,6 +661,7 @@ def parse_show_cdp_neighbors_detail(text: str) -> tuple[list[CdpNeighborDetail],
     Blocks are separated by a line of dashes; a block without a ``Device ID``
     is skipped with a warning rather than guessed at.
     """
+    text = normalise_cli_text(text)   # parse a copy; raw evidence untouched
     records: list[CdpNeighborDetail] = []
     warnings: list[str] = []
 

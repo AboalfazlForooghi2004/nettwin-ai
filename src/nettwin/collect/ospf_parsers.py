@@ -25,6 +25,7 @@ import ipaddress
 import re
 from dataclasses import dataclass, field
 
+from nettwin.collect.cli_text import normalise_cli_text
 from nettwin.domain.ospf_models import (
     OspfInterface,
     OspfLinkType,
@@ -488,6 +489,10 @@ def parse_show_ip_ospf_database_router(
     starts a new link record with its own fields, and an unrecognized type is
     preserved as ``unknown`` with a warning instead of being dropped.
     """
+    # Parse a normalised copy; ``text`` itself is never modified, so callers
+    # that retain the raw output (raw_evidence.yaml) keep exactly what the
+    # device sent, backspaces included.
+    text = normalise_cli_text(text)
     lsas: list[OspfRouterLsa] = []
     warnings: list[str] = []
     if not text or not text.strip():
@@ -682,6 +687,7 @@ def parse_show_ip_ospf_database_network(
     printed as ``/24`` or ``255.255.255.0`` and both are normalized to a
     dotted mask. ``Attached Router`` lines accumulate per LSA.
     """
+    text = normalise_cli_text(text)   # parse a copy; raw evidence is untouched
     lsas: list[OspfNetworkLsa] = []
     warnings: list[str] = []
     if not text or not text.strip():
