@@ -108,6 +108,15 @@ def _ospf_audit(ospf) -> dict:  # noqa: ANN001 - OspfTopology | None
                 "area": lsa.area,
                 "link_state_id": lsa.link_state_id,
                 "advertising_router": lsa.advertising_router,
+                # Sequence and checksum are part of the LSA *identity* (RFC 2328
+                # §13.1/§13.2), not decoration: without them two audits of the
+                # same LSID cannot be told apart, and this projection disagreed
+                # with ``topology.yaml`` for no reason. Router LSAs above always
+                # carried them; dropping them here was an oversight, not a
+                # deliberate narrowing.
+                "sequence": lsa.sequence,
+                "checksum": lsa.checksum,
+                "age": lsa.age,
                 "prefix": lsa.prefix,
                 "attached_routers": lsa.attached_routers,
                 "observed_by": lsa.observed_by,
@@ -134,14 +143,94 @@ def _ospf_audit(ospf) -> dict:  # noqa: ANN001 - OspfTopology | None
             }
             for n in ospf.neighbors
         ],
+        # ``routes`` used to be three keys of *counts*, while ``topology.yaml``
+        # holds the full ``ospf.routes`` list — 48 records there versus a
+        # three-key dict here read as a contradiction. Both were correct; the
+        # summary simply did not say what the 48 were made of. The breakdown
+        # below makes the reconciliation explicit, and states the total so the
+        # two artifacts can be checked against each other.
         "routes": {
+            "total": len(ospf.routes),
             "learned": len(ospf.learned_routes()),
             "connected": len(ospf.connected_routes()),
-            "note": "routing evidence; never used to create a topology link",
+            "by_device": _route_breakdown(ospf.routes, "device_id"),
+            "by_type": _route_breakdown(ospf.routes, "route_type"),
+            "note": (
+                "routing evidence; never used to create a topology link. "
+                "These are ``show ip ospf route`` rows only — generic "
+                "``show ip route`` records live in the physical topology "
+                "document and are deliberately not combined here."
+            ),
         },
         "lsa_counts": ospf.lsa_counts(),
         "state_counts": ospf.state_counts(),
         "warnings": ospf.warnings,
+    }
+
+
+def _route_breakdown(routes, attribute: str) -> dict[str, int]:  # noqa: ANN001
+    """Count ``show ip ospf route`` rows by one attribute, deterministically."""
+    counts: dict[str, int] = {}
+    for route in routes:
+        key = str(getattr(route, attribute, "") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _raw_evidence_audit(result) -> dict:  # noqa: ANN001 - RecursiveDiscoveryResult
+    """Raw CLI text retained for diagnosis, per device and per command.
+
+    Kept in its own artifact rather than inside ``topology.yaml`` or
+    ``discovery.yaml``: the topology document is a *conclusion* that a consumer
+    reads as structured data, and six full LSDB transcripts per device would
+    bury it. Separation also means the evidence can be deleted without touching
+    the result.
+
+    Attribution is explicit — every block names the device whose CLI produced
+    it, because raw text without a source is exactly what made the first live
+    run undiagnosable.
+
+    Scope is whatever the collector retained (``OSPF_RAW_COMMANDS``: six
+    read-only ``show ip ospf ...`` commands). ``show ip ospf interface`` —
+    which can print authentication material — is not in that allowlist and
+    therefore cannot appear here. No credentials, no session data: the
+    connection layer is never asked for its text.
+    """
+    devices: list[dict] = []
+    total = 0
+    for node in result.nodes:
+        observations = getattr(node, "observations", None)
+        if observations is None:
+            continue
+        retained = dict(getattr(observations, "raw_commands", {}) or {})
+        if not retained:
+            continue
+        total += len(retained)
+        devices.append(
+            {
+                "device_id": observations.device_id or node.identity,
+                "identity": node.identity,
+                "commands": {
+                    command: {
+                        "bytes": len(text.encode("utf-8")),
+                        "lines": text.count("\n") + (1 if text and not text.endswith("\n") else 0),
+                        "output": text,
+                    }
+                    for command, text in sorted(retained.items())
+                },
+            }
+        )
+    return {
+        "note": (
+            "raw OSPF CLI evidence, retained so a parse defect stays diagnosable "
+            "after the run. Read-only show commands only."
+        ),
+        "commands_retained": sorted(
+            {command for device in devices for command in device["commands"]}
+        ),
+        "device_count": len(devices),
+        "block_count": total,
+        "devices": devices,
     }
 
 
@@ -451,7 +540,20 @@ def main(argv: list[str] | None = None) -> int:
         yaml.safe_dump(report, sort_keys=False, allow_unicode=True), encoding="utf-8"
     )
 
+    # Raw evidence gets its own artifact, written with the same predictable
+    # structure as the other two. It is produced unconditionally so its absence
+    # is never ambiguous: a run with no OSPF still yields the file, saying so.
+    evidence = _raw_evidence_audit(result)
+    evidence_path = output_dir / "raw_evidence.yaml"
+    evidence_path.write_text(
+        yaml.safe_dump(evidence, sort_keys=False, allow_unicode=True), encoding="utf-8"
+    )
+
     print(f"discovery  : {discovery_path}")
+    print(
+        f"evidence   : {evidence_path} "
+        f"({evidence['block_count']} command output(s) across {evidence['device_count']} device(s))"
+    )
     print(f"stats      : {result.visits} visit(s), {result.ssh_attempts} nested ssh attempt(s)")
     print(f"warnings   : {len(result.warnings)}")
     for warning in result.warnings:

@@ -8,6 +8,7 @@ ones must be pure functions of ``topology.yaml``:
         topology.yaml      the normalized topology
         topology.html      interactive, self-contained
         topology.svg       standalone vector
+        raw_evidence.yaml  raw OSPF CLI text, for diagnosing a parse defect
 
 These tests drive the real recursive engine with scripted IOS transcripts and
 then assert the artifacts, so a regression in wiring (rather than in rendering)
@@ -43,6 +44,22 @@ def _write_run_dir(result, out: Path) -> Path:  # noqa: ANN001 - result object
         yaml.safe_dump({"seed": "192.168.98.34", "warnings": result.warnings}),
         encoding="utf-8",
     )
+    # Raw OSPF CLI evidence. Written unconditionally by the real writer, so the
+    # mirror must write it too — a mirror that drifts from the writer is how the
+    # raw_commands field came to be retained but never persisted.
+    (out / "raw_evidence.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "note": "raw OSPF CLI evidence",
+                "commands_retained": [],
+                "device_count": 0,
+                "block_count": 0,
+                "devices": [],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
     return out
 
 
@@ -55,7 +72,13 @@ def test_run_directory_has_all_four_artifacts(tmp_path: Path) -> None:
     ).run()
     out = _write_run_dir(result, tmp_path / "run1")
     names = {p.name for p in out.iterdir()}
-    assert names == {"discovery.yaml", "topology.yaml", "topology.html", "topology.svg"}
+    assert names == {
+        "discovery.yaml",
+        "topology.yaml",
+        "topology.html",
+        "topology.svg",
+        "raw_evidence.yaml",
+    }
 
 
 def test_topology_yaml_contains_the_confirmed_links(tmp_path: Path) -> None:
