@@ -20,9 +20,23 @@ Design rules applied here:
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
+
+#: LS Age (RFC 2328 §12.1.1) as it must be represented in the domain.
+#:
+#: ``StrictInt`` because the lax ``int | None`` accepted ``True`` as age 1 and
+#: ``"12"`` as age 12 — Pydantic coerced them before any validator could object,
+#: and ``True`` then compared as a genuinely young, winning age. Age is a
+#: 16-bit unsigned seconds counter saturating at ``MaxAge``, so the range is
+#: enforced here as well as in the pipeline: a value outside it never describes
+#: a conforming LSDB.
+#:
+#: ``None`` stays explicitly allowed — a missing LSA header is a legitimate
+#: absence of evidence, and downstream code treats it as unresolved rather than
+#: as agreement.
+OspfAge = Annotated[StrictInt, Field(ge=0, le=3600)]
 
 
 class OspfEvidenceState(StrEnum):
@@ -153,8 +167,19 @@ class OspfRouterLsa(BaseModel):
     advertising_router: str
     sequence: str = ""
     checksum: str = ""
-    age: int | None = None
+    age: OspfAge | None = None
     number_of_links: int | None = None
+    options: str = ""
+    """``Options: (No TOS-capability, DC)`` verbatim.
+
+    RFC 2328 §13.2: a change in the Options field makes two LSAs different
+    instances, so it is part of the content fingerprint. IOS prints it as
+    free text rather than a bitmask, so it is stored as reported.
+    """
+
+    ls_length: int | None = None
+    """``Length: 60`` — the LSA's total length in bytes (RFC 2328 §13.2)."""
+
     links: list[OspfLsaLink] = Field(default_factory=list)
     device_id: str = ""
     command: str = ""
@@ -175,6 +200,31 @@ class OspfRouterLsa(BaseModel):
     conflict is auditable after the winner has been chosen.
     """
 
+    def link_count_mismatch(self) -> str | None:
+        """Describe the disagreement between the declared and actual link count.
+
+        ``Number of Links`` counts the link records in the LSA body (RFC 2328
+        §A.4.2). If it disagrees with the parsed links, the body was truncated,
+        mistranscribed or misparsed — evidence that contradicts itself.
+
+        This is deliberately a *query* rather than a validator. The parser
+        builds an LSA incrementally: it assigns ``number_of_links`` when it
+        reads that line, then attaches links as it walks the body. A model
+        validator would fire on the intermediate state and reject every real
+        LSA. The check belongs where the object is *complete* — see
+        :func:`nettwin.collect.ospf_parsers.parse_show_ip_ospf_database_router`
+        and :func:`nettwin.collect.ospf_topology.canonical_router_lsas`.
+
+        Returns ``None`` when consistent, or when no count was reported (an
+        absence of evidence, not a contradiction).
+        """
+        if self.number_of_links is None or self.number_of_links == len(self.links):
+            return None
+        return (
+            f"LSA {self.link_state_id or '?'} declares {self.number_of_links} "
+            f"link(s) but {len(self.links)} were parsed"
+        )
+
 
 class OspfNetworkLsa(BaseModel):
     """A Network LSA (Type 2) — a transit network's DR view."""
@@ -189,7 +239,13 @@ class OspfNetworkLsa(BaseModel):
     attached_routers: list[str] = Field(default_factory=list)
     sequence: str = ""
     checksum: str = ""
-    age: int | None = None
+    age: OspfAge | None = None
+    options: str = ""
+    """``Options:`` verbatim — part of the LSA content (RFC 2328 §13.2)."""
+
+    ls_length: int | None = None
+    """``Length:`` in bytes — part of the LSA content (RFC 2328 §13.2)."""
+
     device_id: str = ""
     command: str = ""
     observed_by: list[str] = Field(default_factory=list)

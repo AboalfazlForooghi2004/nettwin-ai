@@ -464,27 +464,92 @@ def _single_version(copies: list[OspfRouterLsa] | list[OspfNetworkLsa]) -> bool:
     return all(same_lsa_version(reference, other) for other in copies[1:])
 
 
+def _normalised_options(options: str) -> str:
+    """Canonical, **order-independent** form of an LSA Options field.
+
+    RFC 2328 §12.1.2 defines the Options field as a set of bits. IOS renders
+    those bits as prose, and the rendering varies in ways that do not change the
+    bitmask:
+
+    * decoration — ``(No TOS-capability, DC)`` and ``No TOS-capability, DC``
+      both appear in the reference transcript;
+    * **order** — ``(DC, E-bit)`` and ``(E-bit, DC)`` are the same bits;
+    * case and spacing.
+
+    Comparing the rendered text verbatim would therefore report a content
+    difference where the LSA content is identical, which is exactly the false
+    conflict the fingerprint exists to avoid. So the comparison form lowercases,
+    splits on commas, strips decoration and whitespace, and **sorts what is
+    left** — a set, not a sequence *and not a multiset*.
+
+    Deduplication is part of that, not a detail: ``(DC, DC)`` and ``(DC)``
+    describe the same bit. Sorting alone would keep both copies and report a
+    false content difference, so tokens are folded into a **set** (case-
+    insensitively, since ``DC`` and ``dc`` are the same bit) before sorting.
+    Empty tokens — a trailing comma, ``()``, a blank field — carry no bit at all
+    and are dropped.
+
+    Unknown tokens are *kept*: this function normalises rendering, it does not
+    whitelist vocabulary. A bit it has never seen still distinguishes one LSA
+    from another, so discarding it would merge genuinely different instances.
+
+    Only the comparison form is normalised: the model stores the field exactly
+    as reported, so nothing is lost from the evidence. An empty value stays
+    empty, which is what a transcript without an ``Options:`` line yields.
+
+    Known limit, stated rather than hidden: two *different* bit combinations
+    that render to the same words would compare equal. IOS emits distinct
+    phrases for distinct bits (``DC``, ``E-bit``, ``No TOS-capability``, ``TOS``),
+    so this does not arise in practice, but the bitmask itself is not parsed.
+    """
+    text = " ".join((options or "").split())
+    if text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    tokens = {token.strip().lower() for token in text.split(",")}
+    tokens.discard("")
+    return ",".join(sorted(tokens))
+
+
 def lsa_content_fingerprint(
     lsa: OspfRouterLsa | OspfNetworkLsa,
 ) -> tuple[object, ...]:
     """A comparable fingerprint of an LSA's **body**, excluding LS Age.
 
-    The body is everything the LSA actually asserts: for a Router LSA its links
-    and their metrics, for a Network LSA its mask and attached routers. Age is
-    excluded because ageing is a transport property — two copies of one instance
-    legitimately differ only in how long each router has held them.
+    RFC 2328 §13.2 lists what makes two LSAs different instances: a change in
+    Options, a change in the LS type, a change in LSA length, or a change in the
+    LSA body. Everything the type can carry is therefore included:
 
-    Observer identity and command provenance are excluded too: they describe
-    *who looked*, not *what was seen*.
+    * **Router LSA** — Options, ``Length``, the advertised link count, and every
+      link's type, Link ID, Link Data, mask, metric and MTID.
+    * **Network LSA** — Options, ``Length``, the network mask and the complete
+      attached-router list.
+
+    Two fields are deliberately **excluded**:
+
+    * **LS Age** — ageing is a transport property; two copies of one instance
+      legitimately differ only in how long each router has held them. Treating
+      age as content would make every flooded copy a conflict.
+    * **Observer metadata** — ``device_id``, ``command``, ``observed_by`` and
+      ``observed_instances`` describe *who looked*, not *what was seen*.
+
+    ``number_of_links`` is included even though it is redundant with ``links``:
+    it is the LSA's own claim about its size, and a transcript whose declared
+    count disagrees with its printed links is a real inconsistency worth
+    surfacing rather than silently reconciling.
     """
     if isinstance(lsa, OspfNetworkLsa):
         return (
             "network",
+            _normalised_options(lsa.options),
+            lsa.ls_length,
             lsa.network_mask,
             tuple(sorted(lsa.attached_routers)),
         )
     return (
         "router",
+        _normalised_options(lsa.options),
+        lsa.ls_length,
+        lsa.number_of_links,
         tuple(
             sorted(
                 (
@@ -673,6 +738,18 @@ def canonical_router_lsas(
     grouped: dict[LsaIdentity, list[OspfRouterLsa]] = defaultdict(list)
     for device in devices:
         for lsa in device.router_lsas:
+            # An LSA whose declared link count contradicts its own body is not
+            # evidence: the two halves of the object disagree. The parser drops
+            # these, but a copy can arrive by another route (a hand-built
+            # DeviceObservations, a fixture, a future collector), so the check
+            # is repeated where the object is consumed.
+            mismatch = lsa.link_count_mismatch()
+            if mismatch is not None:
+                warnings.append(
+                    f"{device.device_id}: {mismatch} — excluded from "
+                    "canonicalisation because the copy is internally inconsistent"
+                )
+                continue
             identity = LsaIdentity(
                 area=lsa.area,
                 lsa_type=1,

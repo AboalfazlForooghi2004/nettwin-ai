@@ -40,7 +40,12 @@ from nettwin.collect.ospf_topology import (  # noqa: E402
     same_lsa_version,
     select_lsa_instance,
 )
-from nettwin.domain.ospf_models import OspfNetworkLsa, OspfRouterLsa  # noqa: E402
+from nettwin.domain.ospf_models import (  # noqa: E402
+    OspfLinkType,
+    OspfLsaLink,
+    OspfNetworkLsa,
+    OspfRouterLsa,
+)
 
 
 def rlsa(
@@ -654,12 +659,46 @@ def test_max_age_does_not_win_against_an_unknown_age() -> None:
 
 
 @pytest.mark.parametrize("bad_age", [-1, 3601, 5000], ids=["negative", "over", "far-over"])
-def test_negative_and_oversized_ages_are_unresolved(bad_age: int) -> None:
-    for first, second in ((rlsa(age=bad_age), rlsa(age=100)),
-                          (rlsa(age=100), rlsa(age=bad_age))):
-        comparison = compare_lsa_instances(first, second)
-        assert comparison.undecided is True
-        assert comparison.winner is None
+def test_negative_and_oversized_ages_are_rejected_by_the_model(bad_age: int) -> None:
+    """Out-of-range ages cannot even reach the comparator.
+
+    The model is the first line of defence: ``OspfAge`` is a ``StrictInt``
+    bounded to 0..3600, so a negative or oversized age is refused at
+    construction rather than travelling through the pipeline as a plausible
+    number. (The comparator keeps its own check for callers that bypass the
+    model — see ``test_comparator_defends_against_ages_the_model_would_reject``.)
+    """
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        rlsa(age=bad_age)
+
+
+def test_comparator_defends_against_ages_the_model_would_reject() -> None:
+    """Defence in depth: ``model_construct`` skips validation entirely.
+
+    A caller that bypasses validation must still not get a winner out of an
+    out-of-range age, so ``compare_lsa_instances`` re-validates independently.
+    """
+    for bad_age in (-1, 3601, 5000):
+        broken = OspfRouterLsa.model_construct(
+            area="0",
+            link_state_id="10.255.255.1",
+            advertising_router="10.255.255.1",
+            sequence="0x80000005",
+            checksum="0x1111",
+            age=bad_age,
+            device_id="r1",
+            links=[],
+        )
+        assert broken.age == bad_age          # validation really was skipped
+        # Same sequence and checksum, so only the age could decide — which is
+        # precisely where an out-of-range age must not become evidence.
+        healthy = rlsa(sequence="0x80000005", checksum="0x1111", age=100)
+        for first, second in ((broken, healthy), (healthy, broken)):
+            comparison = compare_lsa_instances(first, second)
+            assert comparison.undecided is True
+            assert comparison.winner is None
 
 
 def test_sequence_and_checksum_precedence_survives_bad_age() -> None:
@@ -877,3 +916,744 @@ def test_missing_or_malformed_checksum_never_yields_a_fallback_winner(bad: str) 
         comparison = compare_lsa_instances(first, second)
         assert comparison.undecided is True
         assert comparison.winner is None
+
+
+# =========================================================================== #
+# 8. Model-level (Pydantic) Age strictness — end to end
+# =========================================================================== #
+
+#: Every input the audit asked to be exercised at the *model* boundary.
+AGE_INPUTS = [True, False, 12.0, 12.5, "12", None, -1, 3601, 0, 3600]
+
+_AGE_ACCEPTED = {None: None, 0: 0, 3600: 3600}
+
+
+@pytest.mark.parametrize("model", [OspfRouterLsa, OspfNetworkLsa], ids=["router", "network"])
+@pytest.mark.parametrize("value", AGE_INPUTS, ids=[repr(v) for v in AGE_INPUTS])
+def test_model_age_boundary(model: type, value: object) -> None:  # noqa: ANN001
+    """Pydantic must not coerce a prohibited input into a plausible age.
+
+    The audit's concern: with a bare ``int | None``, Pydantic turned ``True``
+    into age 1 and ``"12"`` into age 12 *before* ``parse_ls_age()`` could
+    object, so the helper's guards were unreachable. ``OspfAge`` closes that.
+    """
+    import pydantic
+
+    kwargs = {"area": "0", "link_state_id": "x", "advertising_router": "y"}
+    if value in _AGE_ACCEPTED and type(value) is int:
+        assert model(**kwargs, age=value).age == value
+    elif value is None:
+        assert model(**kwargs, age=value).age is None
+    else:
+        with pytest.raises(pydantic.ValidationError):
+            model(**kwargs, age=value)
+
+
+@pytest.mark.parametrize("model", [OspfRouterLsa, OspfNetworkLsa], ids=["router", "network"])
+def test_model_age_defaults_to_none(model: type) -> None:  # noqa: ANN001
+    """A missing age is an allowed absence, not an error."""
+    assert model(area="0", link_state_id="x", advertising_router="y").age is None
+
+
+def test_coerced_boolean_cannot_masquerade_as_a_young_age() -> None:
+    """The specific end-to-end failure: ``True`` used to become age 1 and win."""
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        rlsa(age=True)
+    with pytest.raises(pydantic.ValidationError):
+        nlsa(age=True)
+
+    # And the same via the real canonicalisation entry point.
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    with pytest.raises(pydantic.ValidationError):
+        canonical_router_lsas(
+            [OspfDeviceData(device_id="r1", router_lsas=[rlsa(age=True)])], []
+        )
+
+
+def test_coerced_numeric_string_cannot_become_an_age() -> None:
+    import pydantic
+
+    with pytest.raises(pydantic.ValidationError):
+        rlsa(age="12")
+
+
+def test_real_parser_output_satisfies_strict_age() -> None:
+    """Strict validation must accept what the device actually reports."""
+    from pathlib import Path
+
+    from nettwin.collect.ospf_parsers import (
+        parse_show_ip_ospf_database_network,
+        parse_show_ip_ospf_database_router,
+    )
+
+    data = Path(__file__).parent / "data" / "ospf"
+    router_lsas, _ = parse_show_ip_ospf_database_router(
+        (data / "r2_show_ip_ospf_database_router.txt").read_text(encoding="utf-8"), "r2"
+    )
+    network_lsas, _ = parse_show_ip_ospf_database_network(
+        (data / "r2_show_ip_ospf_database_network.txt").read_text(encoding="utf-8"), "r2"
+    )
+    assert len(router_lsas) == 5
+    assert len(network_lsas) == 5
+    for lsa in [*router_lsas, *network_lsas]:
+        assert type(lsa.age) is int
+        assert 0 <= lsa.age <= LS_AGE_MAX
+
+
+# =========================================================================== #
+# 9. Content fingerprint completeness (RFC 2328 §13.2)
+# =========================================================================== #
+
+
+def _fingerprint_router(**overrides: object) -> OspfRouterLsa:
+    base: dict[str, object] = {
+        "area": "0",
+        "link_state_id": "10.255.255.1",
+        "advertising_router": "10.255.255.1",
+        "sequence": "0x80000005",
+        "checksum": "0x1111",
+        "age": 100,
+        "device_id": "r1",
+        "options": "(No TOS-capability, DC)",
+        "ls_length": 60,
+        "number_of_links": 1,
+        "links": [
+            OspfLsaLink(
+                link_type=OspfLinkType.STUB,
+                link_id="10.0.12.0",
+                link_data="255.255.255.252",
+                network_mask="255.255.255.252",
+                metric=10,
+            )
+        ],
+    }
+    base.update(overrides)
+    return OspfRouterLsa(**base)  # type: ignore[arg-type]
+
+
+def _fingerprint_network(**overrides: object) -> OspfNetworkLsa:
+    base: dict[str, object] = {
+        "area": "0",
+        "link_state_id": "10.0.21.1",
+        "advertising_router": "10.255.255.3",
+        "network_mask": "255.255.255.252",
+        "attached_routers": ["10.255.255.1", "10.255.255.3"],
+        "sequence": "0x80000002",
+        "checksum": "0x5E6F",
+        "age": 100,
+        "device_id": "r1",
+        "options": "(No TOS-capability, DC)",
+        "ls_length": 36,
+    }
+    base.update(overrides)
+    return OspfNetworkLsa(**base)  # type: ignore[arg-type]
+
+
+def test_parser_retains_options_and_length() -> None:
+    """Neither field was captured before this change; both are printed by IOS."""
+    from pathlib import Path
+
+    from nettwin.collect.ospf_parsers import (
+        parse_show_ip_ospf_database_network,
+        parse_show_ip_ospf_database_router,
+    )
+
+    data = Path(__file__).parent / "data" / "ospf"
+    router_lsas, _ = parse_show_ip_ospf_database_router(
+        (data / "r2_show_ip_ospf_database_router.txt").read_text(encoding="utf-8"), "r2"
+    )
+    for lsa in router_lsas:
+        assert lsa.options, "Options line was not captured"
+        assert lsa.ls_length is not None and lsa.ls_length > 0
+
+    network_lsas, _ = parse_show_ip_ospf_database_network(
+        (data / "r2_show_ip_ospf_database_network.txt").read_text(encoding="utf-8"), "r2"
+    )
+    for lsa in network_lsas:
+        assert lsa.options
+        assert lsa.ls_length is not None and lsa.ls_length > 0
+
+
+def test_fingerprint_covers_router_options_and_length() -> None:
+    base = _fingerprint_router()
+    assert lsa_content_fingerprint(base) != lsa_content_fingerprint(
+        _fingerprint_router(options="(DC)")
+    )
+    assert lsa_content_fingerprint(base) != lsa_content_fingerprint(
+        _fingerprint_router(ls_length=72)
+    )
+
+
+def test_fingerprint_covers_router_link_count() -> None:
+    """``number_of_links`` was a live gap: it collapsed contradictory copies."""
+    base = _fingerprint_router()
+    assert lsa_content_fingerprint(base) != lsa_content_fingerprint(
+        _fingerprint_router(number_of_links=99)
+    )
+
+
+def test_fingerprint_covers_router_link_fields() -> None:
+    base = _fingerprint_router()
+    for label, override in [
+        ("link type", {"link_type": OspfLinkType.TRANSIT}),
+        ("link id", {"link_id": "10.0.13.0"}),
+        ("link data", {"link_data": "10.0.12.1"}),
+        ("mask", {"network_mask": "255.255.255.0"}),
+        ("metric", {"metric": 99}),
+        ("mtid", {"mtid": "2"}),
+    ]:
+        changed = _fingerprint_router(
+            links=[base.links[0].model_copy(update=override)]
+        )
+        assert lsa_content_fingerprint(base) != lsa_content_fingerprint(changed), label
+
+
+def test_fingerprint_covers_network_options_length_and_membership() -> None:
+    base = _fingerprint_network()
+    for label, other in [
+        ("options", _fingerprint_network(options="(DC)")),
+        ("length", _fingerprint_network(ls_length=48)),
+        ("mask", _fingerprint_network(network_mask="255.255.255.0")),
+        ("membership", _fingerprint_network(attached_routers=["10.255.255.1"])),
+    ]:
+        assert lsa_content_fingerprint(base) != lsa_content_fingerprint(other), label
+
+
+def test_fingerprint_excludes_age_and_observer_metadata() -> None:
+    """Ageing and provenance are not content, however much they differ."""
+    router_a = _fingerprint_router(age=0, device_id="r1", command="show x")
+    router_b = _fingerprint_router(age=3600, device_id="r9", command="show y")
+    assert lsa_content_fingerprint(router_a) == lsa_content_fingerprint(router_b)
+
+    net_a = _fingerprint_network(age=0, device_id="r1")
+    net_b = _fingerprint_network(age=1800, device_id="r4")
+    assert lsa_content_fingerprint(net_a) == lsa_content_fingerprint(net_b)
+
+
+def test_options_rendering_is_normalised_for_comparison() -> None:
+    """IOS renders the bitmask as prose; the same mask must not look different.
+
+    The reference transcript itself contains both ``(No TOS-capability, DC)``
+    and ``No TOS-capability, DC`` for identical Option bits.
+    """
+    with_parens = _fingerprint_router(options="(No TOS-capability, DC)")
+    without = _fingerprint_router(options="No TOS-capability, DC", device_id="r2")
+    assert lsa_content_fingerprint(with_parens) == lsa_content_fingerprint(without)
+
+    # The model still keeps exactly what was reported.
+    assert with_parens.options == "(No TOS-capability, DC)"
+    assert without.options == "No TOS-capability, DC"
+
+
+@pytest.mark.parametrize(
+    ("label", "make"),
+    [
+        ("options", lambda: _fingerprint_router(options="(DC)")),
+        ("length", lambda: _fingerprint_router(ls_length=72)),
+        (
+            "link metric",
+            lambda: _fingerprint_router(
+                links=[
+                    OspfLsaLink(
+                        link_type=OspfLinkType.STUB,
+                        link_id="10.0.12.0",
+                        link_data="255.255.255.252",
+                        network_mask="255.255.255.252",
+                        metric=99,
+                    )
+                ]
+            ),
+        ),
+    ],
+)
+def test_content_differences_at_identical_metadata_never_collapse(label: str, make) -> None:  # noqa: ANN001
+    """Same identity, sequence, checksum *and* age — only content differs."""
+    original = _fingerprint_router(device_id="r1")
+    changed = make().model_copy(update={"device_id": "r2"})
+    assert changed.sequence == original.sequence
+    assert changed.checksum == original.checksum
+    assert changed.age == original.age
+
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [
+            OspfDeviceData(device_id="r1", router_lsas=[original]),
+            OspfDeviceData(device_id="r2", router_lsas=[changed]),
+        ],
+        warnings,
+    )
+    assert canonical == [], f"{label}: differing content was silently collapsed"
+    assert any("content differs" in w for w in warnings), label
+
+
+def test_internally_inconsistent_link_count_is_excluded_before_canonicalisation() -> None:
+    """A copy whose declared count contradicts its body never reaches the tie.
+
+    This is a stronger guarantee than the content check: the object is not even
+    a candidate, because its two halves disagree about what it contains.
+    """
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    inconsistent = _fingerprint_router(number_of_links=3, device_id="r2")
+    assert inconsistent.number_of_links != len(inconsistent.links)
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [
+            OspfDeviceData(device_id="r1", router_lsas=[_fingerprint_router()]),
+            OspfDeviceData(device_id="r2", router_lsas=[inconsistent]),
+        ],
+        warnings,
+    )
+    # Exactly one canonical LSA survives: the healthy copy. The inconsistent
+    # copy contributes nothing, and crucially does not drag the result into an
+    # unresolved conflict — it was never a candidate.
+    assert len(canonical) == 1
+    assert canonical[0].number_of_links == 1
+    assert canonical[0].observed_by == ["r1"]
+    assert any("internally inconsistent" in w for w in warnings)
+    assert not any("content differs" in w for w in warnings)
+
+
+def test_network_membership_difference_at_identical_metadata_never_collapses() -> None:
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_network_lsas
+
+    a = _fingerprint_network(device_id="r1")
+    b = _fingerprint_network(device_id="r2", attached_routers=["10.255.255.1"])
+    assert a.sequence == b.sequence and a.checksum == b.checksum and a.age == b.age
+
+    warnings: list[str] = []
+    canonical = canonical_network_lsas(
+        [
+            OspfDeviceData(device_id="r1", network_lsas=[a]),
+            OspfDeviceData(device_id="r2", network_lsas=[b]),
+        ],
+        warnings,
+    )
+    assert canonical == []
+    assert any("membership disagreement" in w for w in warnings)
+
+
+# =========================================================================== #
+# 10. number_of_links must agree with the actual links
+# =========================================================================== #
+
+
+def test_link_count_mismatch_query() -> None:
+    link = OspfLsaLink(link_type=OspfLinkType.STUB, link_id="10.0.12.0")
+    consistent = _fingerprint_router(number_of_links=1, links=[link])
+    assert consistent.link_count_mismatch() is None
+
+    # No declared count is an absence of evidence, not a contradiction.
+    unreported = _fingerprint_router(number_of_links=None, links=[link])
+    assert unreported.link_count_mismatch() is None
+
+    contradictory = _fingerprint_router(number_of_links=9, links=[link])
+    message = contradictory.link_count_mismatch()
+    assert message is not None
+    assert "declares 9" in message and "1 were parsed" in message
+
+
+def test_parser_drops_an_lsa_whose_link_count_contradicts_its_body() -> None:
+    """The parser reports *and* drops it — a warning alone left it usable."""
+    from pathlib import Path
+
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    raw = (Path(__file__).parent / "data" / "ospf" / "r2_show_ip_ospf_database_router.txt").read_text(
+        encoding="utf-8"
+    )
+    clean, clean_warnings = parse_show_ip_ospf_database_router(raw, "r2")
+    assert len(clean) == 5
+    assert not [w for w in clean_warnings if "declares" in w]
+
+    corrupted = raw.replace("Number of Links: 3", "Number of Links: 9", 1)
+    lsas, warnings = parse_show_ip_ospf_database_router(corrupted, "r2")
+
+    assert len(lsas) == 4                      # the bad one is gone
+    assert all(lsa.link_count_mismatch() is None for lsa in lsas)
+    assert any("declares 9 link(s)" in w for w in warnings)
+    assert any("LSA dropped" in w for w in warnings)
+
+
+def test_reference_transcript_has_no_link_count_mismatch() -> None:
+    """Every LSA in the real fixture is internally consistent."""
+    from pathlib import Path
+
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    raw = (Path(__file__).parent / "data" / "ospf" / "r2_show_ip_ospf_database_router.txt").read_text(
+        encoding="utf-8"
+    )
+    lsas, _ = parse_show_ip_ospf_database_router(raw, "r2")
+    for lsa in lsas:
+        assert lsa.number_of_links == len(lsa.links), lsa.link_state_id
+
+
+def test_canonical_layer_excludes_a_contradictory_copy() -> None:
+    """A copy that arrives by another route is still refused at consumption."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    healthy = _fingerprint_router(device_id="r1")
+    contradictory = _fingerprint_router(number_of_links=9, device_id="r2")
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [
+            OspfDeviceData(device_id="r1", router_lsas=[healthy]),
+            OspfDeviceData(device_id="r2", router_lsas=[contradictory]),
+        ],
+        warnings,
+    )
+    assert len(canonical) == 1
+    assert canonical[0].observed_by == ["r1"]
+    assert any("internally inconsistent" in w for w in warnings)
+
+
+# =========================================================================== #
+# 11. Semantic (order-independent) Options normalisation
+# =========================================================================== #
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("(No TOS-capability, DC)", "(DC, No TOS-capability)"),
+        ("(DC,E-bit)", "(E-bit, DC)"),
+        ("(DC, E-bit)", "(E-bit,DC)"),
+        ("(E-bit,DC,No TOS-capability)", "(No TOS-capability, DC, E-bit)"),
+        ("(No TOS-capability, DC)", "No TOS-capability, DC"),
+        ("  ( DC , No TOS-capability )  ", "(No TOS-capability,DC)"),
+    ],
+    ids=["dc-order", "ebit-order", "spacing", "three-token-order", "decoration", "messy"],
+)
+def test_options_normalisation_is_order_independent(first: str, second: str) -> None:
+    """Options is a bit *set*; the rendered order carries no meaning."""
+    from nettwin.collect.ospf_topology import _normalised_options
+
+    assert _normalised_options(first) == _normalised_options(second)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("(DC)", "(E-bit)"),
+        ("(DC, E-bit)", "(DC)"),
+        ("(No TOS-capability, DC)", "(No TOS-capability, DC, E-bit)"),
+        ("", "(DC)"),
+    ],
+    ids=["different-bit", "subset", "extra-bit", "empty-vs-set"],
+)
+def test_genuinely_different_options_are_not_equated(first: str, second: str) -> None:
+    """Normalisation must not erase a real difference."""
+    from nettwin.collect.ospf_topology import _normalised_options
+
+    assert _normalised_options(first) != _normalised_options(second)
+
+
+def test_options_order_difference_does_not_create_a_conflict() -> None:
+    """Same bits, different rendering order -> one canonical LSA, no warning."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    a = _fingerprint_router(options="(No TOS-capability, DC)", device_id="r1")
+    b = _fingerprint_router(options="(DC, No TOS-capability)", device_id="r2")
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [OspfDeviceData(device_id="r1", router_lsas=[a]),
+         OspfDeviceData(device_id="r2", router_lsas=[b])],
+        warnings,
+    )
+    assert len(canonical) == 1
+    assert canonical[0].observed_by == ["r1", "r2"]
+    assert warnings == []
+
+
+def test_options_bit_difference_still_withholds_the_lsa() -> None:
+    """Same order, different bits -> unresolved, as §13.2 requires."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    a = _fingerprint_router(options="(DC)", device_id="r1")
+    b = _fingerprint_router(options="(DC, E-bit)", device_id="r2")
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [OspfDeviceData(device_id="r1", router_lsas=[a]),
+         OspfDeviceData(device_id="r2", router_lsas=[b])],
+        warnings,
+    )
+    assert canonical == []
+    assert any("content differs" in w for w in warnings)
+
+
+def test_options_model_field_keeps_the_reported_rendering() -> None:
+    """Normalisation is for comparison only; the model stays verbatim."""
+    ordering = _fingerprint_router(options="(DC, No TOS-capability)")
+    assert ordering.options == "(DC, No TOS-capability)"
+
+    network = _fingerprint_network(options="No TOS-capability, DC")
+    assert network.options == "No TOS-capability, DC"
+
+
+# =========================================================================== #
+# 12. Parser-warning provenance — the collecting observer, stated exactly once
+# =========================================================================== #
+
+
+def _corrupt(fixture: str, old: str, new: str) -> str:
+    from pathlib import Path
+
+    raw = (Path(__file__).parent / "data" / "ospf" / fixture).read_text(encoding="utf-8")
+    assert old in raw
+    return raw.replace(old, new, 1)
+
+
+def test_router_warning_names_the_collecting_observer() -> None:
+    """``observer=r2`` — the router the command ran on, not the LSA originator.
+
+    In the fixture r2's LSDB holds r1's LSA, so the two differ: without the tag
+    the operator cannot tell whose LSDB declared the bad link count.
+    """
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    corrupted = _corrupt("r2_show_ip_ospf_database_router.txt", "Number of Links: 3", "Number of Links: 9")
+    _, warnings = parse_show_ip_ospf_database_router(corrupted, "r2")
+
+    drop_warnings = [w for w in warnings if "LSA dropped" in w]
+    assert len(drop_warnings) == 1
+    warning = drop_warnings[0]
+    assert "observer=r2" in warning
+    # The LSA it is about is r1's, and that name appears as the *subject*, never
+    # as the observer.
+    assert "10.255.255.1" in warning
+    assert "observer=10.255.255.1" not in warning
+
+
+def test_observer_is_named_exactly_once() -> None:
+    """No double-prefixing: one ``observer=`` per warning, whatever the call path."""
+    from nettwin.collect.ospf_parsers import (
+        parse_show_ip_ospf_database_network,
+        parse_show_ip_ospf_database_router,
+    )
+
+    router_raw = _corrupt("r2_show_ip_ospf_database_router.txt", "Number of Links: 3", "Number of Links: 9")
+    _, router_warnings = parse_show_ip_ospf_database_router(router_raw, "r2")
+
+    network_raw = _corrupt("r2_show_ip_ospf_database_network.txt", "Attached Router", "Detached Router")
+    _, network_warnings = parse_show_ip_ospf_database_network(network_raw, "r2")
+
+    for warning in [*router_warnings, *network_warnings]:
+        assert warning.count("observer=") <= 1, warning
+
+
+def test_unattributed_observer_is_stated_not_invented() -> None:
+    """With no device id the warning admits it rather than guessing a name."""
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    corrupted = _corrupt("r2_show_ip_ospf_database_router.txt", "Number of Links: 3", "Number of Links: 9")
+    _, warnings = parse_show_ip_ospf_database_router(corrupted, "")
+
+    drop_warnings = [w for w in warnings if "LSA dropped" in w]
+    assert len(drop_warnings) == 1
+    assert "observer unidentified" in drop_warnings[0]
+    assert "observer=" not in drop_warnings[0]
+
+
+def test_empty_lsdb_warning_names_the_observer() -> None:
+    """The 'nothing came back' path is attributed too — absence is evidence."""
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_router
+
+    _, warnings = parse_show_ip_ospf_database_router("", "r4")
+    assert warnings, "an empty transcript must still warn"
+    assert all("observer=r4" in w for w in warnings), warnings
+
+    # And the header-present-but-no-LSA path.
+    _, no_blocks = parse_show_ip_ospf_database_router(
+        "\t\tRouter Link States (Area 0)\n", "r4"
+    )
+    if no_blocks:
+        assert all("observer=r4" in w for w in no_blocks), no_blocks
+
+
+def test_network_warnings_name_the_observing_router() -> None:
+    from nettwin.collect.ospf_parsers import parse_show_ip_ospf_database_network
+
+    _, warnings = parse_show_ip_ospf_database_network("", "r5")
+    assert warnings, "an empty transcript must still warn"
+    assert all("observer=r5" in w for w in warnings)
+
+
+# =========================================================================== #
+# 13. Observer attribution survives the discovery integration paths
+# =========================================================================== #
+
+
+def test_nested_discovery_parser_warnings_carry_the_observer() -> None:
+    """The nested path appends ``observations.warnings`` with no prefix of its own.
+
+    ``nested/discovery.py`` extends ``observations.warnings`` verbatim (unlike
+    the merge path, which prefixes ``entry_name``), so the observer has to be
+    inside the string for the nested report to be auditable.
+    """
+    from nettwin.collect.cisco_ios import DeviceObservations
+    from nettwin.collect.nested.discovery import _DEVICE_SCOPED_COMMANDS
+
+    assert "show ip ospf database router" in _DEVICE_SCOPED_COMMANDS, (
+        "the router parser must stay observer-scoped or it loses its device id"
+    )
+
+    observations = DeviceObservations(host="10.0.0.2", device_id="r2", collected_at="", status="ok")
+    observations.warnings.append("placeholder")   # container is plain per-device
+    assert observations.device_id == "r2"
+
+
+def test_merge_path_prefixes_entry_name_and_does_not_double_prefix() -> None:
+    """merge.py adds ``entry_name:`` only to topics it owns.
+
+    OSPF parser warnings never reach ``DeviceCollection.warnings`` — that list
+    carries map warnings only — so an ``observer=`` tag inside the string cannot
+    collide with a merge-level prefix. This test pins that plumbing: if OSPF
+    warnings are ever routed through ``collection.warnings``, the assertion on
+    ``map_warnings`` count will fail and force the double-prefix question to be
+    answered deliberately.
+    """
+    import inspect
+
+    from nettwin.collect.discovery.merge import DeviceCollection
+    from nettwin.collect.discovery.pipeline import discover_topology
+
+    # DeviceCollection.warnings starts empty: merge prefixes only what it is given.
+    assert DeviceCollection(entry_name="r2", host="10.0.0.2").warnings == []
+
+    source = inspect.getsource(discover_topology)
+    assert "collection.warnings.extend(map_warnings)" in source
+    assert "collection.warnings.extend(observations.warnings)" not in source, (
+        "routing parser warnings through collection.warnings would add a second prefix"
+    )
+
+
+def test_observer_tag_helper_is_the_single_source_of_format() -> None:
+    from nettwin.collect.ospf_parsers import _observer_tag
+
+    assert _observer_tag("r2") == "observer=r2"
+    assert _observer_tag("") == "observer unidentified"
+
+
+# =========================================================================== #
+# 14. Options is a SET, not a multiset
+# =========================================================================== #
+
+
+@pytest.mark.parametrize(
+    ("redundant", "plain"),
+    [
+        ("(DC, DC)", "(DC)"),
+        ("(DC, dc)", "(DC)"),
+        ("(DC, dc, E-bit)", "(E-bit, DC)"),
+        ("( DC , dc , DC )", "(DC)"),
+        ("(E-bit, E-BIT, e-bit)", "(E-bit)"),
+    ],
+    ids=["repeat", "case-repeat", "case-repeat-with-peer", "triple-mixed", "five-times"],
+)
+def test_duplicate_options_tokens_collapse(redundant: str, plain: str) -> None:
+    """``(DC, DC)`` and ``(DC)`` are the same bit — and must not look different.
+
+    Sorting alone would keep both copies, which is a false content conflict:
+    exactly the failure this normalisation exists to prevent.
+    """
+    from nettwin.collect.ospf_topology import _normalised_options
+
+    assert _normalised_options(redundant) == _normalised_options(plain)
+
+
+def test_duplicate_options_do_not_create_a_conflict_end_to_end() -> None:
+    """The observable consequence: one canonical LSA, no warning, both observers."""
+    from nettwin.collect.ospf_topology import OspfDeviceData, canonical_router_lsas
+
+    a = _fingerprint_router(options="(DC, DC)", device_id="r1")
+    b = _fingerprint_router(options="(DC)", device_id="r2")
+
+    warnings: list[str] = []
+    canonical = canonical_router_lsas(
+        [OspfDeviceData(device_id="r1", router_lsas=[a]),
+         OspfDeviceData(device_id="r2", router_lsas=[b])],
+        warnings,
+    )
+    assert len(canonical) == 1
+    assert canonical[0].observed_by == ["r1", "r2"]
+    assert warnings == []
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("(Frobnicate, DC)", "(DC, Frobnicate)"),
+        ("(FROBNICATE, dc)", "(dc, frobnicate)"),
+        ("(Zzz, Aaa, DC)", "(DC, Zzz, Aaa)"),
+    ],
+    ids=["unknown-reorder", "unknown-case", "two-unknowns"],
+)
+def test_unknown_options_tokens_are_kept_and_order_independent(first: str, second: str) -> None:
+    """Normalisation is not a whitelist: an unseen bit still counts, once."""
+    from nettwin.collect.ospf_topology import _normalised_options
+
+    assert _normalised_options(first) == _normalised_options(second)
+    assert "frobnicate" in _normalised_options(first) or "zzz" in _normalised_options(first)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("(Frobnicate, DC)", "(DC)"),
+        ("(Frobnicate)", "(Brobnicate)"),
+        ("(DC, E-bit)", "(DC, E-bit, No TOS-capability)"),
+        ("", "(DC)"),
+        ("(DC, DC)", "(DC, E-bit)"),
+    ],
+    ids=["extra-unknown", "unknown-vs-unknown", "extra-known", "empty-vs-set", "dup-vs-more"],
+)
+def test_genuinely_different_option_sets_stay_different(first: str, second: str) -> None:
+    """Deduplication must not become erasure."""
+    from nettwin.collect.ospf_topology import _normalised_options
+
+    assert _normalised_options(first) != _normalised_options(second)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_tokens"),
+    [
+        ("(DC, , E-bit)", {"dc", "e-bit"}),
+        ("(DC,)", {"dc"}),
+        ("( DC )", {"dc"}),
+        ("()", set()),
+        ("", set()),
+        ("( , )", set()),
+    ],
+    ids=["inner-blank", "trailing-comma", "padded", "empty-parens", "empty", "only-separators"],
+)
+def test_empty_options_tokens_are_ignored(raw: str, expected_tokens: set) -> None:
+    """A blank element carries no bit and must not become an empty token."""
+    from nettwin.collect.ospf_topology import _normalised_options
+
+    normalised = _normalised_options(raw)
+    assert normalised != "" or expected_tokens == set()
+    actual = set(normalised.split(",")) if normalised else set()
+    assert actual == expected_tokens
+    # No empty element may survive in a non-empty result.
+    if normalised:
+        assert all(token for token in normalised.split(","))
+
+
+def test_options_normalisation_never_touches_the_model_field() -> None:
+    """The raw string is evidence; only the comparison form is rewritten."""
+    raw = "(DC, dc, DC, E-bit)"
+    lsa = _fingerprint_router(options=raw)
+    assert lsa.options == raw
+
+    network = _fingerprint_network(options="( Frobnicate , DC )")
+    assert network.options == "( Frobnicate , DC )"

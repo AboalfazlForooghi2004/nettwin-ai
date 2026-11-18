@@ -304,7 +304,12 @@ def test_router_lsa_unrecognized_link_type_kept_as_unknown() -> None:
 def test_router_lsa_empty_output() -> None:
     lsas, warnings = P.parse_show_ip_ospf_database_router("")
     assert lsas == []
-    assert warnings == ["show ip ospf database router: empty output"]
+    # The warning must admit that no observer identity was available rather
+    # than inventing one.
+    assert warnings == ["show ip ospf database router [observer unidentified]: empty output"]
+
+    _, attributed = P.parse_show_ip_ospf_database_router("", "r4")
+    assert attributed == ["show ip ospf database router [observer=r4]: empty output"]
 
 
 def test_router_lsa_declared_link_count_mismatch_warns() -> None:
@@ -322,8 +327,13 @@ def test_router_lsa_declared_link_count_mismatch_warns() -> None:
      (Link Data) Network Mask: 255.255.255.0
       TOS 0 Metrics: 1
 """
-    _, warnings = P.parse_show_ip_ospf_database_router(text, "r1")
-    assert any("declares 5 link(s) but 1 parsed" in w for w in warnings)
+    lsas, warnings = P.parse_show_ip_ospf_database_router(text, "r1")
+    # Reported...
+    assert any("declares 5 link(s) but 1 were parsed" in w for w in warnings)
+    # ...and withheld: an LSA whose own count contradicts its body is not
+    # evidence, so it must not travel onward as if it were.
+    assert lsas == []
+    assert any("LSA dropped" in w for w in warnings)
 
 
 def test_router_lsa_missing_advertising_router_warns() -> None:
@@ -428,7 +438,10 @@ def test_network_lsa_missing_mask_warns_and_prefix_is_none() -> None:
 def test_network_lsa_empty_output() -> None:
     lsas, warnings = P.parse_show_ip_ospf_database_network("")
     assert lsas == []
-    assert warnings == ["show ip ospf database network: empty output"]
+    assert warnings == ["show ip ospf database network [observer unidentified]: empty output"]
+
+    _, attributed = P.parse_show_ip_ospf_database_network("", "r5")
+    assert attributed == ["show ip ospf database network [observer=r5]: empty output"]
 
 
 # =========================================================================== #

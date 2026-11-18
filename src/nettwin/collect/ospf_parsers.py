@@ -351,6 +351,23 @@ class _RouterLsaBuilder:
         return finished
 
 
+def _observer_tag(device_id: str) -> str:
+    """Name the device whose command output this warning came from.
+
+    Every LSDB warning is about *evidence*, and evidence without a source is
+    not auditable: ``declares 9 link(s)`` means nothing until you know whose
+    LSDB said so. This is the **collecting observer** — the router the command
+    was issued on — and explicitly *not* the LSA's Advertising Router, which is
+    the originating router named inside the LSA. In a multi-observer run the
+    two differ constantly (r2's LSDB contains r1's Router LSA), so conflating
+    them would point the operator at the wrong device.
+
+    ``device_id`` is empty only when the caller had no observer identity at
+    all, in which case the tag says so rather than inventing a name.
+    """
+    return f"observer={device_id}" if device_id else "observer unidentified"
+
+
 def parse_show_ip_ospf_database_router(
     text: str, device_id: str = ""
 ) -> tuple[list[OspfRouterLsa], list[str]]:
@@ -379,7 +396,9 @@ def parse_show_ip_ospf_database_router(
     lsas: list[OspfRouterLsa] = []
     warnings: list[str] = []
     if not text or not text.strip():
-        return lsas, ["show ip ospf database router: empty output"]
+        return lsas, [
+            f"show ip ospf database router [{_observer_tag(device_id)}]: empty output"
+        ]
 
     area = ""
     builder = _RouterLsaBuilder()
@@ -479,28 +498,50 @@ def parse_show_ip_ospf_database_router(
                 builder.lsa.checksum = value
             elif key == "number of links":
                 builder.lsa.number_of_links = _to_int(value)
+            elif key == "options":
+                # RFC 2328 §13.2: Options is part of the LSA's content.
+                builder.lsa.options = value
+            elif key == "length":
+                # The LSA's own length in bytes, also content per §13.2.
+                builder.lsa.ls_length = _to_int(value)
             continue
 
     finished = builder.flush_lsa(warnings)
     if finished is not None:
         lsas.append(finished)
 
+    kept: list[OspfRouterLsa] = []
     for lsa in lsas:
+        mismatch = lsa.link_count_mismatch()
+        if mismatch is not None:
+            # The LSA is internally inconsistent: its own declared count disagrees
+            # with the body we walked. Reported and dropped rather than passed on
+            # — evidence that contradicts itself cannot decide which LSA instance
+            # is current, and it would otherwise reach the fingerprint as a
+            # contradictory pair of fields.
+            warnings.append(
+                f"show ip ospf database router [{_observer_tag(device_id)}]: "
+                f"{mismatch} — LSA dropped"
+            )
+            continue
         if not lsa.link_state_id:
             warnings.append(
-                "show ip ospf database router: LSA with no Link State ID — "
-                "kept but not attributable"
+                f"show ip ospf database router [{_observer_tag(device_id)}]: "
+                "LSA with no Link State ID — kept but not attributable"
             )
         if not lsa.advertising_router:
-            warnings.append("show ip ospf database router: LSA with no Advertising Router")
-        if lsa.number_of_links is not None and lsa.number_of_links != len(lsa.links):
             warnings.append(
-                f"show ip ospf database router: {lsa.link_state_id or '?'} declares "
-                f"{lsa.number_of_links} link(s) but {len(lsa.links)} parsed"
+                f"show ip ospf database router [{_observer_tag(device_id)}]: "
+                "LSA with no Advertising Router"
             )
+        kept.append(lsa)
+    lsas = kept
 
     if not lsas and not saw_header:
-        warnings.append("show ip ospf database router: no Router LSA blocks parsed")
+        warnings.append(
+            f"show ip ospf database router [{_observer_tag(device_id)}]: "
+            "no Router LSA blocks parsed"
+        )
     return lsas, warnings
 
 
@@ -526,7 +567,9 @@ def parse_show_ip_ospf_database_network(
     lsas: list[OspfNetworkLsa] = []
     warnings: list[str] = []
     if not text or not text.strip():
-        return lsas, ["show ip ospf database network: empty output"]
+        return lsas, [
+            f"show ip ospf database network [{_observer_tag(device_id)}]: empty output"
+        ]
 
     area = ""
     current: OspfNetworkLsa | None = None
@@ -593,6 +636,10 @@ def parse_show_ip_ospf_database_network(
                 current.sequence = value
             elif key == "checksum":
                 current.checksum = value
+            elif key == "options":
+                current.options = value
+            elif key == "length":
+                current.ls_length = _to_int(value)
             continue
 
     flush()
@@ -600,22 +647,27 @@ def parse_show_ip_ospf_database_network(
     for lsa in lsas:
         if not lsa.link_state_id:
             warnings.append(
-                "show ip ospf database network: LSA with no Link State ID (DR address) — "
-                "kept but not attributable"
+                f"show ip ospf database network [{_observer_tag(device_id)}]: "
+                "LSA with no Link State ID (DR address) — kept but not attributable"
             )
         if not lsa.attached_routers:
             warnings.append(
-                f"show ip ospf database network: {lsa.link_state_id or '?'} has no "
+                f"show ip ospf database network [{_observer_tag(device_id)}]: "
+                f"{lsa.link_state_id or '?'} has no "
                 "Attached Router rows — membership unknown"
             )
         if not lsa.network_mask:
             warnings.append(
-                f"show ip ospf database network: {lsa.link_state_id or '?'} has no "
+                f"show ip ospf database network [{_observer_tag(device_id)}]: "
+                f"{lsa.link_state_id or '?'} has no "
                 "Network Mask — prefix cannot be computed"
             )
 
     if not lsas:
-        warnings.append("show ip ospf database network: no Network LSA blocks parsed")
+        warnings.append(
+            f"show ip ospf database network [{_observer_tag(device_id)}]: "
+            "no Network LSA blocks parsed"
+        )
     return lsas, warnings
 
 
